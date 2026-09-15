@@ -515,8 +515,8 @@ class ComAdapter(PowerDesignerAdapter):
             if m is None:
                 raise OperationFailedError(f"PowerDesigner failed to open '{path}'")
             detected = self._detect_kind(m)
-            if detected != kind:
-                kind = detected  # trust the API over the suffix
+            # trust the API over the suffix; do NOT rebind `kind` here —
+            # assigning inside this closure raised UnboundLocalError (live-verified)
             model_id = self._ensure_model_entry(m, detected)
             self._models[model_id]["file"] = str(p.resolve())
             self._models[model_id]["read_only"] = bool(read_only)
