@@ -26,6 +26,7 @@ UpdateReferenceJoins,Mandatory,ParentRole,ChildRole}``,
 
 from __future__ import annotations
 
+import logging
 import re
 import threading
 import time
@@ -863,11 +864,14 @@ class ComAdapter(PowerDesignerAdapter):
         name = spec.get("name") or spec.get("code")
         code = spec.get("code") or name
         _set_name_code(col, name, code)
-        col_attrs = (("DataType", "data_type"), ("Length", "length"),
-                     ("Precision", "precision"), ("DefaultValue", "default_value"))
-        for api, key in col_attrs:
-            if spec.get(key) is not None:
-                _try_set(col, **{api: spec[key]})
+        if spec.get("default_value") is not None:
+            _try_set(col, DefaultValue=spec["default_value"])
+        # Length/Precision must ride on the DataType string; direct
+        # Column.Length assignment is a silent no-op on PD 16.5 (live-verified)
+        full_dt = _compose_full_data_type(spec.get("data_type"),
+                                          spec.get("length"), spec.get("precision"))
+        if full_dt:
+            _try_set(col, DataType=full_dt)
         if spec.get("mandatory") is not None:
             _try_set(col, Mandatory=bool(spec["mandatory"]))
         if spec.get("comment"):
@@ -931,12 +935,15 @@ class ComAdapter(PowerDesignerAdapter):
                 _set_name_code(col, name or _safe(col, "Name", ""),
                                code or _safe(col, "Code", ""))
             kwargs: Dict[str, Any] = {}
-            for api, key in (("DataType", "data_type"), ("DefaultValue", "default_value")):
-                if updates.get(key) is not None:
-                    kwargs[api] = updates[key]
-            for api in ("Length", "Precision"):
-                if updates.get(api.lower()) is not None:
-                    kwargs[api] = updates[api.lower()]
+            if updates.get("default_value") is not None:
+                kwargs["DefaultValue"] = updates["default_value"]
+            # Length/Precision must ride on the DataType string; direct
+            # Column.Length assignment is a silent no-op on PD 16.5 (live-verified)
+            full_dt = _compose_full_data_type(
+                updates.get("data_type") or _safe(col, "DataType", ""),
+                updates.get("length"), updates.get("precision"))
+            if full_dt:
+                kwargs["DataType"] = full_dt
             if updates.get("mandatory") is not None:
                 kwargs["Mandatory"] = bool(updates["mandatory"])
             if updates.get("comment") is not None:
@@ -1114,6 +1121,9 @@ class ComAdapter(PowerDesignerAdapter):
             ref = m.References.CreateNew(ref_cls)
             ref_name = name or f"FK_{_safe(child, 'Code', '')}_{_safe(parent, 'Code', '')}"
             _set_name_code(ref, ref_name, code or ref_name)
+            # PD prepends its own "FK_" template prefix when this is left
+            # empty, producing duplicated names like FK_FK_xxx (live-verified)
+            _try_set(ref, ForeignKeyConstraintName=code or ref_name)
             if comment:
                 _try_set(ref, Comment=comment)
             _try_set(ref, ParentTable=parent)
@@ -1122,6 +1132,17 @@ class ComAdapter(PowerDesignerAdapter):
             if parent_columns and child_columns:
                 if len(parent_columns) != len(child_columns):
                     raise InvalidParamsError("parent_columns and child_columns must have equal length")
+                # PD auto-derives joins as soon as ChildTable is assigned;
+                # clear them first, otherwise explicit joins are duplicated
+                # (live-verified: two identical user_id->user_id joins)
+                for auto_join in list(_iter_coll(_safe(ref, "Joins", None))):
+                    try:
+                        auto_join.Delete()
+                    except Exception:
+                        try:
+                            _safe(ref, "Joins", None).Remove(auto_join)
+                        except Exception:
+                            pass
                 for pc_code, cc_code in zip(parent_columns, child_columns):
                     pc = _find_in_coll(parent, "Columns", pc_code)
                     cc = _find_in_coll(child, "Columns", cc_code)
@@ -1544,6 +1565,7 @@ def _safe(obj: Any, attr: str, default: Any = None) -> Any:
 
 
 def _try_set(obj: Any, **kwargs: Any) -> None:
+    log = logging.getLogger(__name__)
     for attr, value in kwargs.items():
         try:
             setattr(obj, attr, value)
@@ -1551,7 +1573,9 @@ def _try_set(obj: Any, **kwargs: Any) -> None:
             try:
                 obj.SetAttribute(attr, value)
             except Exception:
-                pass  # property unavailable in this PD version/build
+                log.warning("_try_set: could not set %s on %s (property "
+                            "unavailable or rejected)", attr,
+                            _safe(obj, "Name", obj))
 
 
 def _set_name_code(obj: Any, name: str, code: str) -> None:
@@ -1569,6 +1593,39 @@ def _set_name_code(obj: Any, name: str, code: str) -> None:
             obj.Code = code
         except Exception:
             pass
+
+
+def _base_type_name(data_type: Any) -> str:
+    """'VARCHAR(50)' -> 'VARCHAR' (strip parenthesised length/precision)."""
+    dt = str(data_type or "").strip()
+    i = dt.find("(")
+    return (dt[:i].strip() if i > 0 else dt).upper()
+
+
+def _compose_full_data_type(base: Any, length: Any, precision: Any) -> Optional[str]:
+    """Carry length/precision inside the DataType string.
+
+    Verified live on PD 16.5.0.3982 COM: assigning ``Column.Length`` /
+    ``Column.Precision`` directly is a *silent no-op* (no exception raised,
+    value stays 0) — lengths must be set via e.g. ``DataType='VARCHAR(50)'``
+    or ``DataType='DECIMAL(10,2)'``.
+    """
+    base = _base_type_name(base)
+    if not base:
+        return None
+
+    def _int(v: Any) -> int:
+        try:
+            return int(v) if v is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    ln, pc = _int(length), _int(precision)
+    if ln > 0 and pc > 0:
+        return f"{base}({ln},{pc})"
+    if ln > 0:
+        return f"{base}({ln})"
+    return base
 
 
 def _coll_count(coll: Any) -> int:
@@ -1618,6 +1675,26 @@ def _model_file(m: Any) -> Optional[str]:
         return None
 
 
+def _attach_link_via_invoke(diagram: Any, obj: Any) -> bool:
+    """Diagram.AttachLinkObject via raw IDispatch.
+
+    Link-type objects (Reference/...) must be attached with AttachLinkObject;
+    plain AttachObject is a *silent no-op* for them on PD 16.5 (live-verified).
+    pywin32 dynamic binding cannot construct AttachLinkObject's optional
+    parameters ("The Python instance can not be converted to a COM object"),
+    so the call goes through the raw IDispatch - same pattern as
+    GenerateDatabase.  Returns False when the call is not applicable.
+    """
+    try:
+        import pythoncom
+        ole = diagram._oleobj_
+        dispid = ole.GetIDsOfNames(0, "AttachLinkObject")
+        ole.Invoke(dispid, 0, pythoncom.DISPATCH_METHOD, False, obj._oleobj_)
+        return True
+    except Exception:
+        return False
+
+
 def _attach_to_first_diagram(model_obj: Any, obj: Any) -> None:
     """Attach a symbol so the object is visible in the default diagram."""
     for attr in ("PhysicalDiagrams", "ConceptualDiagrams", "LogicalDiagrams"):
@@ -1625,7 +1702,11 @@ def _attach_to_first_diagram(model_obj: Any, obj: Any) -> None:
         if diagrams is not None:
             try:
                 diagram = diagrams.Item(0)
-                diagram.AttachObject(obj)
+                attached = False
+                if hasattr(obj, "Joins"):
+                    attached = _attach_link_via_invoke(diagram, obj)
+                if not attached:
+                    diagram.AttachObject(obj)
             except Exception:
                 pass
             return
