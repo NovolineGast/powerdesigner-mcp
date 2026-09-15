@@ -1,7 +1,7 @@
 # powerdesigner-mcp 需求合规审查报告
 
 > 审查对象：最初 29 节《PowerDesigner MCP Server 开发需求》提示词 vs 实际交付
-> （`E:\PowerDesigner-MCP\powerdesigner-mcp\`，PowerDesigner 16.5.0.3982 真机验收）
+> （本机仓库根目录，PowerDesigner 16.5.0.3982 真机验收）
 > 结论标记：✅ 完全符合 ｜ 🟡 基本符合/有差异说明 ｜ ⚠️ 未实现或部分实现
 
 ## 一、逐条审查

@@ -19,9 +19,9 @@ class TestModelManagement:
         with pytest.raises(InvalidParamsError):
             adapter.create_model("XXX", "M", "m")
 
-    def test_open_missing_file(self, adapter):
+    def test_open_missing_file(self, adapter, tmp_path):
         with pytest.raises(ObjectNotFoundError):
-            adapter.open_model(r"E:\no_such.pdm")
+            adapter.open_model(str(tmp_path / "no_such.pdm"))
 
     def test_save_unsaved_raises(self, adapter):
         mid = adapter.create_model("PDM", "M", "m")["model_id"]

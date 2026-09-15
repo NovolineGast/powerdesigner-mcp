@@ -12,6 +12,10 @@ logs/
 backups/
 *.log
 
+# Machine-specific MCP client configs (use *.example templates instead)
+mcp-configs/*.json
+mcp-configs/*.txt
+
 # Environment / secrets
 .env
 .pdmcp.json
