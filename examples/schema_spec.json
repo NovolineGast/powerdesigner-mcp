@@ -1,0 +1,42 @@
+{
+  "tables": [
+    {
+      "name": "用户",
+      "code": "sys_user",
+      "comment": "系统用户表",
+      "columns": [
+        {"name": "用户ID", "code": "user_id", "data_type": "INT", "mandatory": true, "primary": true, "comment": "主键"},
+        {"name": "用户名", "code": "username", "data_type": "VARCHAR(50)", "mandatory": true, "comment": "登录名"},
+        {"name": "密码", "code": "password", "data_type": "VARCHAR(100)", "mandatory": true, "comment": "加密密码"},
+        {"name": "手机号", "code": "user_phone", "data_type": "VARCHAR(20)", "comment": "手机号"}
+      ],
+      "indexes": [
+        {"name": "idx_user_phone", "columns": ["user_phone"]}
+      ]
+    },
+    {
+      "name": "订单",
+      "code": "sys_order",
+      "comment": "订单表",
+      "columns": [
+        {"name": "订单ID", "code": "order_id", "data_type": "INT", "mandatory": true, "primary": true, "comment": "主键"},
+        {"name": "下单时间", "code": "create_time", "data_type": "DATETIME", "mandatory": true, "comment": "下单时间"}
+      ],
+      "indexes": [
+        {"name": "idx_order_user_time", "columns": ["user_id", "create_time"]}
+      ]
+    }
+  ],
+  "relationships": [
+    {
+      "parent_table": "sys_user",
+      "child_table": "sys_order",
+      "name": "FK_order_user",
+      "cardinality": "0,n",
+      "comment": "用户 1:N 订单"
+    }
+  ],
+  "domains": [
+    {"name": "金额", "code": "MONEY", "data_type": "DECIMAL(12,2)", "comment": "统一金额精度"}
+  ]
+}

@@ -1,0 +1,22 @@
+{
+  "model": {"kind": "CDM", "name": "图书管理系统", "code": "LibraryMIS"},
+  "tables": [
+    {"name": "读者", "code": "reader", "columns": [
+      {"code": "reader_id", "data_type": "Numeric(8,0)", "primary": true, "mandatory": true, "comment": "读者编号"},
+      {"code": "reader_name", "data_type": "Variable characters(30)", "mandatory": true, "comment": "姓名"}
+    ]},
+    {"name": "图书", "code": "book", "columns": [
+      {"code": "book_id", "data_type": "Numeric(8,0)", "primary": true, "mandatory": true, "comment": "图书编号"},
+      {"code": "title", "data_type": "Variable characters(80)", "mandatory": true, "comment": "书名"}
+    ]},
+    {"name": "借阅记录", "code": "borrow_record", "columns": [
+      {"code": "record_id", "data_type": "Numeric(10,0)", "primary": true, "mandatory": true, "comment": "记录号"},
+      {"code": "reader_id", "data_type": "Numeric(8,0)", "comment": "读者FK"},
+      {"code": "book_id", "data_type": "Numeric(8,0)", "comment": "图书FK"}
+    ]}
+  ],
+  "relationships": [
+    {"parent_table": "reader", "child_table": "borrow_record", "name": "rel_reader_borrow", "cardinality": "0,n"},
+    {"parent_table": "book", "child_table": "borrow_record", "name": "rel_book_borrow", "cardinality": "0,n"}
+  ]
+}

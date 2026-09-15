@@ -1,0 +1,8 @@
+# Claude Code 注册命令（任选其一，推荐第一条）
+
+claude mcp add powerdesigner -- E:/PowerDesigner-MCP/powerdesigner-mcp/.venv/Scripts/python.exe -m pd_mcp serve
+
+# 若 PYTHONPATH 未生效，改用安装为包的方式：
+#   cd E:/PowerDesigner-MCP/powerdesigner-mcp
+#   .venv\Scripts\python.exe -m pip install -e .
+#   claude mcp add powerdesigner -- E:/PowerDesigner-MCP/powerdesigner-mcp/.venv/Scripts/powerdesigner-mcp.exe serve

@@ -1,0 +1,9 @@
+{
+  "mcpServers": {
+    "powerdesigner": {
+      "command": "E://PowerDesigner-MCP//powerdesigner-mcp//.venv//Scripts//python.exe",
+      "args": ["-m", "pd_mcp", "serve"],
+      "env": { "PYTHONPATH": "E://PowerDesigner-MCP//powerdesigner-mcp//src" }
+    }
+  }
+}

@@ -1,0 +1,18 @@
+{
+  "operations": [
+    {"op": "create_table", "table": {"name": "商品", "code": "sys_product",
+     "columns": [
+       {"code": "product_id", "data_type": "INT", "primary": true, "mandatory": true, "comment": "主键"},
+       {"code": "product_name", "data_type": "VARCHAR(100)", "mandatory": true, "comment": "商品名"},
+       {"code": "category_id", "data_type": "INT", "comment": "分类FK"}
+     ]}},
+    {"op": "create_primary_key", "table": "sys_product", "columns": ["product_id"], "name": "PK_sys_product"},
+    {"op": "create_reference", "reference": {"parent_table": "sys_category",
+     "child_table": "sys_product", "name": "FK_product_category", "cardinality": "0,n"}},
+    {"op": "create_index", "table": "sys_product",
+     "index": {"name": "idx_product_category", "columns": ["category_id"]}},
+    {"op": "alter_column", "table": "sys_user", "column": "username",
+     "updates": {"mandatory": true}},
+    {"op": "drop_column", "table": "sys_user", "column": "obsolete_col"}
+  ]
+}

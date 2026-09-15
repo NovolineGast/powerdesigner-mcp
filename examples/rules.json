@@ -1,0 +1,14 @@
+{
+  "rules": [
+    {"id": "TABLE_001", "description": "所有表必须存在主键", "type": "TABLE_HAS_PK"},
+    {"id": "COLUMN_001", "description": "所有字段必须有 Comment", "type": "COLUMN_HAS_COMMENT"},
+    {"id": "NAME_001", "description": "表名必须使用 snake_case", "type": "TABLE_NAME_STYLE", "params": {"style": "snake_case"}},
+    {"id": "NAME_002", "description": "表名必须以 sys_ 开头", "type": "TABLE_CODE_PATTERN", "params": {"pattern": "sys_.*"}},
+    {"id": "PK_001", "description": "主键命名必须以 PK_ 开头", "type": "PK_NAME_PATTERN", "params": {"pattern": "PK_.*"}},
+    {"id": "FK_001", "description": "外键命名必须以 FK_ 开头", "type": "FK_NAME_PATTERN", "params": {"pattern": "FK_.*"}},
+    {"id": "IDX_001", "description": "索引命名必须以 idx_ 或 uq_ 开头", "type": "INDEX_NAME_PATTERN", "params": {"pattern": "(idx|uq)_.*"}},
+    {"id": "COL_002", "description": "每张表必须包含审计列", "type": "REQUIRED_COLUMNS", "params": {"columns": ["created_at", "updated_at"]}},
+    {"id": "TYPE_001", "description": "只允许使用课程规定数据类型", "type": "DATA_TYPE_ALLOWED", "params": {"allowed": ["INT", "BIGINT", "VARCHAR", "DATETIME", "DECIMAL", "TEXT"]}},
+    {"id": "IDX_002", "description": "不允许重复索引", "type": "NO_DUPLICATE_INDEX"}
+  ]
+}

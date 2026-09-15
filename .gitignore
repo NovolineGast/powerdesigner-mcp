@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Runtime artifacts
+logs/
+backups/
+*.log
+
+# Environment / secrets
+.env
+.pdmcp.json
+
+# IDE / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
+
+# pytest
+.pytest_cache/
+logsexp4.sql
