@@ -122,6 +122,32 @@ claude mcp add powerdesigner -- C:\path\to\powerdesigner-mcp\.venv\Scripts\pytho
 ```
 </details>
 
+<details>
+<summary><b>WorkBuddy</b> — <code>%USERPROFILE%\.workbuddy\mcp.json</code></summary>
+
+```json
+{
+  "mcpServers": {
+    "powerdesigner": {
+      "command": "C:\\path\\to\\powerdesigner-mcp\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "pd_mcp", "serve"],
+      "env": {
+        "PYTHONPATH": "C:\\path\\to\\powerdesigner-mcp\\src",
+        "PDMCP_ATTACH_MODE": "auto",
+        "PDMCP_DEFAULT_DBMS": "MySQL 5.0"
+      }
+    }
+  }
+}
+```
+
+After writing the file, open **Connector management → Custom connectors (top-right)
+→ Trust** the `powerdesigner` server; new MCP servers do not activate automatically.
+If your client cannot pass `env`, install the package into the venv
+(`uv pip install -e .`) and/or point `command` at
+`scripts\powerdesigner-mcp.cmd` (portable wrapper, leave `args` empty).
+</details>
+
 ## Tool catalog (55+)
 
 | Group | Tools |
