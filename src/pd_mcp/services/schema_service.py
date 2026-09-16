@@ -44,6 +44,12 @@ def build_schema_ops(spec: Dict[str, Any], model_kind: str = "PDM") -> List[Dict
         raise InvalidParamsError("schema spec must be a JSON object")
     ops: List[Dict[str, Any]] = []
 
+    if model_kind != "PDM" and (spec.get("indexes")
+                               or any(e.get("indexes") for e in spec.get("tables") or [])):
+        raise InvalidParamsError(
+            f"Indexes do not exist in a {model_kind} model - they are a physical "
+            "(PDM) concept. Drop the index entries and convert to a PDM first.")
+
     for dom in spec.get("domains") or []:
         ops.append({"op": "create_domain", "domain": dom})
 
@@ -66,7 +72,8 @@ def build_schema_ops(spec: Dict[str, Any], model_kind: str = "PDM") -> List[Dict
         ops.extend(_column_ops(code, entry.get("columns") or [], pk_columns))
         if pk_columns:
             ops.append({"op": "create_primary_key", "table": code, "columns": pk_columns,
-                        "name": entry.get("primary_key_name") or f"PK_{code}"})
+                        "name": entry.get("primary_key_name") or
+                                (f"PK_{code}" if model_kind == "PDM" else f"ID_{code}")})
         # inline indexes
         for idx in entry.get("indexes") or []:
             ops.append({"op": "create_index", "table": code,
@@ -91,6 +98,8 @@ def build_schema_ops(spec: Dict[str, Any], model_kind: str = "PDM") -> List[Dict
             "name": rel.get("name"), "code": rel.get("code"),
             "comment": rel.get("comment", ""),
             "cardinality": rel.get("cardinality"),
+            "parent_cardinality": rel.get("parent_cardinality"),
+            "dependent_role": rel.get("dependent_role"),
         }})
     return ops
 
@@ -100,6 +109,14 @@ def _summary(ops: List[Dict[str, Any]]) -> Dict[str, int]:
     for o in ops:
         counts[o["op"]] = counts.get(o["op"], 0) + 1
     return counts
+
+
+def _model_kind(adapter, model_id: str) -> str:
+    """Kind of an existing model, for vocabulary-correct plan rendering."""
+    try:
+        return (adapter.get_model_info(model_id).get("kind") or "PDM").upper()
+    except Exception:
+        return "PDM"
 
 
 # ---------------------------------------------------------------------------
@@ -115,17 +132,27 @@ PATCH_OPS = {
 }
 
 
-def _describe(op: Dict[str, Any]) -> str:
+def _describe(op: Dict[str, Any], model_kind: str = "PDM") -> str:
+    """Human-readable one-liner for an op, in the target model's vocabulary."""
+    conceptual = model_kind.upper() != "PDM"
+    entity = "ENTITY" if conceptual else "TABLE"
+    member = "ATTRIBUTE" if conceptual else "COLUMN"
+    key_word = "IDENTIFIER" if conceptual else "PRIMARY KEY"
     o = op.get("op")
     if o == "create_table":
-        return f"CREATE TABLE {op['table']['code']}"
+        return f"CREATE {entity} {op['table']['code']}"
     if o == "add_column":
-        return f"ADD COLUMN {op['table']}.{op['column']['code']}"
+        return f"ADD {member} {op['table']}.{op['column']['code']}"
     if o == "create_primary_key":
-        return f"PRIMARY KEY {op['table']}({', '.join(op['columns'])})"
+        return f"{key_word} {op['table']}({', '.join(op['columns'])})"
     if o == "create_reference":
         ref = op["reference"]
-        return f"REFERENCE {ref.get('name') or ''}: {ref['parent_table']} -> {ref['child_table']}"
+        card = ref.get("cardinality") or "0,n"
+        parent_card = ref.get("parent_cardinality") or "1,1"
+        dep = f" dependent_role={ref['dependent_role']}" if ref.get("dependent_role") else ""
+        label = "RELATIONSHIP" if conceptual else "REFERENCE"
+        return (f"{label} {ref.get('name') or ''}: {ref['parent_table']} "
+                f"({card}) -> {ref['child_table']} ({parent_card}){dep}")
     if o == "create_index":
         idx = op["index"]
         return f"INDEX {op['table']}.({', '.join(idx.get('columns') or [])})"
@@ -133,21 +160,21 @@ def _describe(op: Dict[str, Any]) -> str:
         d = op["domain"]
         return f"DOMAIN {d.get('code') or d.get('name')}"
     if o == "drop_table":
-        return f"DROP TABLE {op['table']}"
+        return f"DROP {entity} {op['table']}"
     if o == "drop_column":
-        return f"DROP COLUMN {op['table']}.{op['column']}"
+        return f"DROP {member} {op['table']}.{op['column']}"
     if o == "drop_reference":
         return f"DROP REFERENCE {op['reference']}"
     if o == "drop_index":
         return f"DROP INDEX {op['table']}.{op['index']}"
     if o == "alter_table":
-        return f"ALTER TABLE {op['table']} {op.get('updates')}"
+        return f"ALTER {entity} {op['table']} {op.get('updates')}"
     if o == "rename_table":
-        return f"RENAME TABLE {op['table']} -> {op.get('new_name')}/{op.get('new_code')}"
+        return f"RENAME {entity} {op['table']} -> {op.get('new_name')}/{op.get('new_code')}"
     if o == "alter_column":
-        return f"ALTER COLUMN {op['table']}.{op['column']} {op.get('updates')}"
+        return f"ALTER {member} {op['table']}.{op['column']} {op.get('updates')}"
     if o == "drop_primary_key":
-        return f"DROP PRIMARY KEY {op['table']}"
+        return f"DROP {key_word} {op['table']}"
     if o == "alter_reference":
         return f"ALTER REFERENCE {op['reference']} {op.get('updates')}"
     if o == "alter_index":
@@ -206,7 +233,8 @@ def _record(txn_manager, txn_id: str, model_id: str, op: Dict[str, Any],
 
 
 def execute_ops(adapter, model_id: str, ops: List[Dict[str, Any]],
-                txn_manager=None, atomic: bool = True) -> Dict[str, Any]:
+                txn_manager=None, atomic: bool = True,
+                model_kind: str = "PDM") -> Dict[str, Any]:
     """Execute a flat op list against the adapter."""
     executed: List[str] = []
     results: List[Dict[str, Any]] = []
@@ -222,7 +250,7 @@ def execute_ops(adapter, model_id: str, ops: List[Dict[str, Any]],
                     f"Valid operations: {', '.join(sorted(PATCH_OPS))}")
             old_props = _capture_old(adapter, model_id, op)
             res = _exec_one(adapter, model_id, op)
-            executed.append(_describe(op))
+            executed.append(_describe(op, model_kind))
             results.append({"index": i, "op": name, "ok": True, "result": res})
             if txn is not None:
                 _record(txn_manager, txn["txn_id"], model_id, op, res, old_props)
@@ -278,7 +306,9 @@ def _exec_one(adapter, model_id: str, op: Dict[str, Any]) -> Any:
             parent_columns=ref.get("parent_columns"), child_columns=ref.get("child_columns"),
             name=ref.get("name", ""), code=ref.get("code", ""),
             comment=ref.get("comment", ""), cardinality=ref.get("cardinality"),
-            update_key=bool(ref.get("update_key", True)))
+            update_key=bool(ref.get("update_key", True)),
+            parent_cardinality=ref.get("parent_cardinality"),
+            dependent_role=ref.get("dependent_role"))
     if name == "alter_reference":
         return adapter.update_reference(model_id, op["reference"], op.get("updates") or {})
     if name == "drop_reference":
@@ -304,12 +334,17 @@ def _exec_one(adapter, model_id: str, op: Dict[str, Any]) -> Any:
 def create_database_schema(adapter, model_id: str, spec: Dict[str, Any],
                            dry_run: bool = False, atomic: bool = True,
                            txn_manager=None) -> Dict[str, Any]:
-    adapter.get_model_info(model_id)  # validate model exists
-    ops = build_schema_ops(spec, model_kind="PDM")
+    # the plan must follow the target model's kind: a CDM/LDM builds
+    # entities/attributes/identifiers and has no indexes at all
+    info = adapter.get_model_info(model_id)  # validates the model exists
+    kind = info.get("kind") or "PDM"
+    ops = build_schema_ops(spec, model_kind=kind)
     if dry_run:
-        return {"success": True, "dry_run": True, "plan": [_describe(o) for o in ops],
+        return {"success": True, "dry_run": True,
+                "plan": [_describe(o, kind) for o in ops],
                 "operations": ops, "summary": _summary(ops)}
-    result = execute_ops(adapter, model_id, ops, txn_manager=txn_manager, atomic=atomic)
+    result = execute_ops(adapter, model_id, ops, txn_manager=txn_manager,
+                         atomic=atomic, model_kind=kind)
     result["dry_run"] = False
     return result
 
@@ -319,6 +354,7 @@ def apply_schema_patch(adapter, model_id: str, operations: List[Dict[str, Any]],
                        txn_manager=None) -> Dict[str, Any]:
     if not isinstance(operations, list) or not operations:
         raise InvalidParamsError("operations must be a non-empty JSON array")
+    kind = _model_kind(adapter, model_id)
     if dry_run:
         plan = []
         for op in operations:
@@ -326,10 +362,11 @@ def apply_schema_patch(adapter, model_id: str, operations: List[Dict[str, Any]],
                 raise InvalidParamsError(
                     f"Unknown operation '{op.get('op')}'. "
                     f"Valid operations: {', '.join(sorted(PATCH_OPS))}")
-            plan.append(_describe(op))
+            plan.append(_describe(op, kind))
         return {"success": True, "dry_run": True, "plan": plan, "operations": operations,
                 "summary": _summary(operations)}
-    result = execute_ops(adapter, model_id, operations, txn_manager=txn_manager, atomic=atomic)
+    result = execute_ops(adapter, model_id, operations, txn_manager=txn_manager,
+                         atomic=atomic, model_kind=kind)
     result["dry_run"] = False
     return result
 
@@ -348,7 +385,7 @@ def design_from_spec(adapter, spec: Dict[str, Any], model_id: Optional[str] = No
             return {"success": True, "dry_run": True,
                     "would_create_model": {"kind": kind, "name": model.get("name"),
                                            "code": model.get("code"), "dbms": model.get("dbms")},
-                    "plan": [_describe(o) for o in ops], "operations": ops,
+                    "plan": [_describe(o, kind) for o in ops], "operations": ops,
                     "summary": _summary(ops)}
         created_model = adapter.create_model(
             kind, name=model.get("name") or "New Model",
@@ -361,9 +398,10 @@ def design_from_spec(adapter, spec: Dict[str, Any], model_id: Optional[str] = No
     ops = build_schema_ops(spec, model_kind=kind)
     if dry_run:
         return {"success": True, "dry_run": True, "model_id": model_id,
-                "plan": [_describe(o) for o in ops], "operations": ops,
+                "plan": [_describe(o, kind) for o in ops], "operations": ops,
                 "summary": _summary(ops)}
-    result = execute_ops(adapter, model_id, ops, txn_manager=txn_manager, atomic=atomic)
+    result = execute_ops(adapter, model_id, ops, txn_manager=txn_manager,
+                         atomic=atomic, model_kind=kind)
     result["dry_run"] = False
     result["model_id"] = model_id
     if created_model:

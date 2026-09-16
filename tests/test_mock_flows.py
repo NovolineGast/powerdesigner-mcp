@@ -175,10 +175,12 @@ class TestDdlAndConversion:
         cdm = adapter.create_model("CDM", "Shop", "shop")["model_id"]
         e1 = adapter.create_table(cdm, "Customer", "customer")["ref"]
         adapter.create_column(cdm, e1, {"name": "CustId", "code": "cust_id",
-                                        "data_type": "INT", "primary": True})
+                                        "data_type": "INT"})
+        adapter.create_primary_key(cdm, e1, ["cust_id"])
         e2 = adapter.create_table(cdm, "Address", "address")["ref"]
         adapter.create_column(cdm, e2, {"name": "AddrId", "code": "addr_id",
-                                        "data_type": "INT", "primary": True})
+                                        "data_type": "INT"})
+        adapter.create_primary_key(cdm, e2, ["addr_id"])
         adapter.create_reference(cdm, e1, e2, name="rel_cust_addr")
         res = adapter.convert_model(cdm, "PDM")
         tid = res["target_model"]["model_id"]
@@ -187,3 +189,79 @@ class TestDdlAndConversion:
         assert {"customer", "address"} <= tables
         refs = adapter.list_references(tid)
         assert len(refs) == 1
+
+
+class TestConceptualModels:
+    """CDM/LDM differ from a PDM: Attributes/Identifiers, no indexes.
+
+    These run on the mock, but every assertion encodes behaviour that was
+    live-verified against PowerDesigner 16.5 - the mock must not accept
+    anything the real backend rejects.
+    """
+
+    def test_attribute_primary_flag_is_not_a_key(self, cdm):
+        a, mid = cdm["adapter"], cdm["model_id"]
+        col = a.create_column(mid, cdm["customer"],
+                             {"name": "Email", "code": "email",
+                              "data_type": "Variable characters(50)",
+                              "primary": True})
+        assert col["primary"] is False
+        assert [k["code"] for k in a.list_keys(mid, cdm["customer"])] == ["ID_customer"]
+
+    def test_primary_identifier_replaces_previous(self, cdm):
+        a, mid = cdm["adapter"], cdm["model_id"]
+        pk = a.create_primary_key(mid, cdm["customer"], ["customer_id"])
+        assert pk["primary"] is True
+        assert [c["code"] for c in pk["columns"]] == ["customer_id"]
+
+        a.create_column(mid, cdm["customer"], {"name": "Phone2", "code": "phone2",
+                                               "data_type": "Characters(11)"})
+        a.create_primary_key(mid, cdm["customer"], ["customer_id", "phone2"])
+        keys = a.list_keys(mid, cdm["customer"])
+        assert len(keys) == 1, "the replaced identifier must not be left behind"
+        assert {c["code"] for c in keys[0]["columns"]} == {"customer_id", "phone2"}
+
+    def test_removing_primary_identifier(self, cdm):
+        a, mid = cdm["adapter"], cdm["model_id"]
+        res = a.remove_primary_key(mid, cdm["customer"])
+        assert res["removed"] == "primary_key"
+        assert a.list_keys(mid, cdm["customer"]) == []
+
+    def test_relationship_keeps_columns_out_of_it(self, cdm):
+        a, mid = cdm["adapter"], cdm["model_id"]
+        rel = a.list_references(mid)[0]
+        assert rel["parent_table"] == "customer" and rel["child_table"] == "address"
+        # a CDM association maps no columns - PD migrates identifiers later
+        assert rel["parent_columns"] == [] and rel["child_columns"] == []
+        assert rel["cardinality"] == "0,n"
+        assert rel["parent_cardinality"] == "1,1"
+
+    def test_relationship_ref_is_reusable(self, cdm):
+        """list_references hands out refs that get_reference/update must accept."""
+        a, mid = cdm["adapter"], cdm["model_id"]
+        rel_ref = a.list_references(mid)[0]["ref"]
+        assert a.get_reference(mid, rel_ref)["code"] == "rel_customer_address"
+        updated = a.update_reference(mid, rel_ref,
+                                     {"cardinality": "1,n", "parent_cardinality": "0,n",
+                                      "dependent_role": "B"})
+        assert updated["cardinality"] == "1,n"
+        assert updated["parent_cardinality"] == "0,n"
+        assert updated["dependent_role"] == "B"
+
+    def test_indexes_are_rejected(self, cdm):
+        a, mid = cdm["adapter"], cdm["model_id"]
+        for call in (lambda: a.create_index(mid, cdm["customer"], ["phone"]),
+                     lambda: a.update_index(mid, cdm["customer"], "idx_x", {"unique": True}),
+                     lambda: a.delete_index(mid, cdm["customer"], "idx_x")):
+            with pytest.raises(InvalidParamsError):
+                call()
+
+    def test_ldm_behaves_like_cdm(self, adapter):
+        ldm = adapter.create_model("LDM", "Shop", "shop")["model_id"]
+        e = adapter.create_table(ldm, "Customer", "customer")["ref"]
+        adapter.create_column(ldm, e, {"name": "CustId", "code": "cust_id",
+                                       "data_type": "Integer"})
+        pk = adapter.create_primary_key(ldm, e, ["cust_id"])
+        assert pk["primary"] and pk["code"].startswith("ID_")
+        with pytest.raises(InvalidParamsError):
+            adapter.create_index(ldm, e, ["cust_id"])

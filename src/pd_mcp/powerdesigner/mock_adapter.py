@@ -26,7 +26,7 @@ from ..errors import (
     PdMcpError,
 )
 from .adapter import PowerDesignerAdapter
-from .constants import MODEL_KINDS
+from .constants import MODEL_KINDS, kind_meta, supports_indexes
 
 
 class _Store:
@@ -333,6 +333,10 @@ class MockAdapter(PowerDesignerAdapter):
         if not name:
             raise InvalidParamsError("Column name is required")
         code = spec.get("code") or name
+        # CDM/LDM attributes carry no primary flag (live-verified on PD 16.5):
+        # the entity points at an Identifier instead, so honouring the flag
+        # here would let the mock drift away from the real backend
+        conceptual = not supports_indexes(m.kind)
         with self._lock:
             for c in t["columns"].values():
                 if c["code"] == code:
@@ -349,7 +353,7 @@ class MockAdapter(PowerDesignerAdapter):
                 "comment": spec.get("comment") or "",
                 "description": spec.get("description") or "",
                 "domain": spec.get("domain"),
-                "primary": bool(spec.get("primary")),
+                "primary": bool(spec.get("primary")) and not conceptual,
             }
             t["columns"][ref] = col
             if col["primary"]:
@@ -365,7 +369,8 @@ class MockAdapter(PowerDesignerAdapter):
                       "mandatory", "default_value", "comment", "description", "domain"):
             if field in updates and updates[field] is not None:
                 c[field] = updates[field]
-        if "primary" in updates and updates["primary"] is not None:
+        # see create_column: the primary flag only exists in a PDM
+        if updates.get("primary") is not None and supports_indexes(m.kind):
             want = bool(updates["primary"])
             if want and not c["primary"]:
                 c["primary"] = True
@@ -411,16 +416,22 @@ class MockAdapter(PowerDesignerAdapter):
             col = self._find(t["columns"], c, "Column")
             col_refs.append(col["ref"])
         with self._lock:
+            # the replaced key is dropped, not just demoted: the COM backend
+            # deletes the previous PK object/identifier when a new one is set
             old = self._pk_key(t)
             if old:
-                old["primary"] = False
+                del t["keys"][old["ref"]]
             ref = self._next_id("k")
-            key = {"ref": ref, "name": name or f"PK_{t['code']}",
-                   "code": code or name or f"PK_{t['code']}",
+            default_name = f"ID_{t['code']}" if not supports_indexes(m.kind) else f"PK_{t['code']}"
+            key = {"ref": ref, "name": name or default_name,
+                   "code": code or name or default_name,
                    "primary": True, "columns": col_refs, "table": t["ref"]}
             t["keys"][ref] = key
-            for c in t["columns"].values():
-                c["primary"] = c["ref"] in col_refs
+            # attributes have no primary flag in a CDM/LDM - the entity points
+            # at the identifier instead
+            if supports_indexes(m.kind):
+                for c in t["columns"].values():
+                    c["primary"] = c["ref"] in col_refs
             return self._key_dict(key, t)
 
     def remove_primary_key(self, model_id: str, table_ref: str) -> Dict[str, Any]:
@@ -451,7 +462,9 @@ class MockAdapter(PowerDesignerAdapter):
                          child_columns: Optional[List[str]] = None,
                          name: str = "", code: str = "", comment: str = "",
                          cardinality: Optional[str] = None,
-                         update_key: bool = True) -> Dict[str, Any]:
+                         update_key: bool = True,
+                         parent_cardinality: Optional[str] = None,
+                         dependent_role: Optional[str] = None) -> Dict[str, Any]:
         m = self._model(model_id)
         if m.read_only:
             raise PdMcpError(ErrorCode.READ_ONLY, "Model is read-only")
@@ -459,6 +472,24 @@ class MockAdapter(PowerDesignerAdapter):
         child = self._table(m, child_table)
         if parent["ref"] == child["ref"]:
             raise InvalidParamsError("Self-referencing tables are not supported by this tool")
+        conceptual = not supports_indexes(m.kind)
+        if conceptual:
+            # CDM/LDM associations carry no column mapping or FK migration,
+            # mirroring the COM backend where those arguments are ignored
+            ref = self._next_id("r")
+            r = {"ref": ref,
+                 "name": name or code or f"rel_{parent['code']}_{child['code']}",
+                 "code": code or name or f"rel_{parent['code']}_{child['code']}",
+                 "comment": comment,
+                 "parent_table": parent["ref"], "child_table": child["ref"],
+                 "parent_columns": [], "child_columns": [],
+                 "cardinality": cardinality or "0,n",
+                 "parent_cardinality": parent_cardinality or "1,1",
+                 "dependent_role": dependent_role or "",
+                 "update_key": update_key}
+            with self._lock:
+                m.references[ref] = r
+            return self._reference_dict(r, m)
         # resolve join columns
         if parent_columns:
             pcols = [self._find(parent["columns"], c, "Column") for c in parent_columns]
@@ -498,6 +529,8 @@ class MockAdapter(PowerDesignerAdapter):
                  "parent_columns": [c["ref"] for c in pcols],
                  "child_columns": [c["ref"] for c in ccols],
                  "cardinality": cardinality or "0,n",
+                 "parent_cardinality": parent_cardinality or "1,1",
+                 "dependent_role": dependent_role or "",
                  "update_key": update_key}
             m.references[ref] = r
             return self._reference_dict(r, m)
@@ -505,7 +538,8 @@ class MockAdapter(PowerDesignerAdapter):
     def update_reference(self, model_id: str, reference_ref: str, updates: Dict[str, Any]) -> Dict[str, Any]:
         m = self._model(model_id)
         r = self._find(m.references, reference_ref, "Reference")
-        for field in ("name", "code", "comment", "cardinality"):
+        for field in ("name", "code", "comment", "cardinality",
+                      "parent_cardinality", "dependent_role"):
             if updates.get(field) is not None:
                 r[field] = updates[field]
         return self._reference_dict(r, m)
@@ -535,12 +569,24 @@ class MockAdapter(PowerDesignerAdapter):
         idx = self._find(t["indexes"], index_ref, "Index")
         return self._index_dict(idx, t)
 
+    def _require_index_support(self, m) -> None:
+        """Mirror the COM backend: indexes exist in a PDM only.
+
+        Without this the mock happily accepts indexes on a CDM and the failure
+        only shows up on a real PowerDesigner run.
+        """
+        if not supports_indexes(m.kind):
+            raise InvalidParamsError(
+                f"Indexes do not exist in a {m.kind} model - they are a physical "
+                "(PDM) concept. Convert to a PDM first, or use keys/identifiers.")
+
     def create_index(self, model_id: str, table_ref: str, columns: List[str],
                      name: str = "", code: str = "", unique: bool = False,
                      comment: str = "") -> Dict[str, Any]:
         m = self._model(model_id)
         if m.read_only:
             raise PdMcpError(ErrorCode.READ_ONLY, "Model is read-only")
+        self._require_index_support(m)
         t = self._table(m, table_ref)
         if not columns:
             raise InvalidParamsError("Index needs at least one column")
@@ -559,6 +605,7 @@ class MockAdapter(PowerDesignerAdapter):
     def update_index(self, model_id: str, table_ref: str, index_ref: str,
                      updates: Dict[str, Any]) -> Dict[str, Any]:
         m = self._model(model_id)
+        self._require_index_support(m)
         t = self._table(m, table_ref)
         idx = self._find(t["indexes"], index_ref, "Index")
         for field in ("name", "code", "comment", "unique"):
@@ -571,6 +618,7 @@ class MockAdapter(PowerDesignerAdapter):
 
     def delete_index(self, model_id: str, table_ref: str, index_ref: str) -> Dict[str, Any]:
         m = self._model(model_id)
+        self._require_index_support(m)
         t = self._table(m, table_ref)
         idx = self._find(t["indexes"], index_ref, "Index")
         del t["indexes"][idx["ref"]]

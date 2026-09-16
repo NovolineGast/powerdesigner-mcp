@@ -81,10 +81,13 @@ def register(mcp, backend: Backend) -> None:
     # Column
     # ------------------------------------------------------------------
     @mcp.tool(name="create_column", description=(
-        "Add a column to a table. Supported properties: name, code, data_type "
-        "(e.g. 'VARCHAR', 'INT', 'DATETIME'), length, precision, mandatory, "
-        "default_value, comment, description, domain (ref or code), primary "
-        "(include in primary key). Supports dry_run."))
+        "Add a column to a table (an attribute, in CDM/LDM terms). Supported "
+        "properties: name, code, data_type (e.g. 'VARCHAR', 'INT', 'DATETIME'), "
+        "length, precision, mandatory, default_value, comment, description, "
+        "domain (ref or code), primary (include in primary key). In a CDM/LDM "
+        "the data type is rendered in PowerDesigner's own vocabulary "
+        "('Variable characters(20)') and 'primary' is ignored - primacy is set "
+        "with create_primary_key. Supports dry_run."))
     @tool_result
     def create_column(model_id: str, table_ref: str, name: str, code: str = "",
                       data_type: str = "", length: int = 0, precision: int = 0,
@@ -164,6 +167,8 @@ def register(mcp, backend: Backend) -> None:
         "Create (or replace) the primary key of a table from the given column "
         "codes. Supports single-column and composite keys, e.g. "
         "columns=['order_id','product_id']. Existing PK membership is cleared. "
+        "In a CDM/LDM this builds the entity's primary identifier (attributes "
+        "carry no primary flag there) and points the entity at it. "
         "Supports dry_run."))
     @tool_result
     def create_primary_key(model_id: str, table_ref: str, columns: list,
@@ -202,42 +207,58 @@ def register(mcp, backend: Backend) -> None:
     # Reference (FK)
     # ------------------------------------------------------------------
     @mcp.tool(name="create_reference", description=(
-        "Create a foreign-key reference between two PDM tables (1:N from parent "
-        "to child). If parent_columns/child_columns are omitted, the parent's "
-        "primary key is used and FK columns are auto-created in the child "
-        "(update_key=true, e.g. user 1--N order creates order.user_id). "
-        "cardinality like '0,n' or '1,1'. Supports dry_run."))
+        "Create an association between two objects. In a PDM this is a "
+        "foreign-key reference (parent 1--N child); if parent_columns/"
+        "child_columns are omitted the parent's primary key is used and FK "
+        "columns are auto-created in the child (update_key=true, e.g. user "
+        "1--N order creates order.user_id). In a CDM/LDM it is a conceptual "
+        "relationship between entities: parent_table/child_table name Entity1/"
+        "Entity2, parent_columns/child_columns/update_key are ignored. "
+        "cardinality = multiplicity at the child end ('0,n', '1,1', '1,n'; "
+        "'0..*' also accepted); parent_cardinality = multiplicity at the parent "
+        "end (default '1,1'; set '0,n' on both for M:N). dependent_role marks a "
+        "weak/dependent side as 'A'/'B', '1'/'2' or an entity code. Supports "
+        "dry_run."))
     @tool_result
     def create_reference(model_id: str, parent_table: str, child_table: str,
                          parent_columns: Optional[list] = None,
                          child_columns: Optional[list] = None, name: str = "",
                          code: str = "", comment: str = "", cardinality: str = "0,n",
-                         update_key: bool = True, dry_run: bool = False) -> dict:
+                         update_key: bool = True, dry_run: bool = False,
+                         parent_cardinality: str = "", dependent_role: str = "") -> dict:
         adapter = backend.connected_adapter()
         if dry_run:
             pk_note = (f"using parent PK {'+'.join(parent_columns)}" if parent_columns
                        else "using parent primary key columns")
             return {"success": True, "dry_run": True,
-                    "plan": [f"REFERENCE {name or '(auto-name)'}: {parent_table} 1--N "
-                             f"{child_table} ({pk_note}, cardinality={cardinality}, "
-                             f"auto_fk={update_key})"]}
+                    "plan": [f"REFERENCE {name or '(auto-name)'}: {parent_table} "
+                             f"({cardinality}) -> {child_table} "
+                             f"({parent_cardinality or '1,1'}) ({pk_note}, "
+                             f"auto_fk={update_key}"
+                             + (f", dependent={dependent_role})" if dependent_role else ")")]}
         return {"success": True, "reference": adapter.create_reference(
             model_id, parent_table, child_table, parent_columns, child_columns,
-            name, code, comment, cardinality, update_key)}
+            name, code, comment, cardinality, update_key,
+            parent_cardinality or None, dependent_role or None)}
 
     @mcp.tool(name="update_reference", description=(
         "Update a reference: name, code, comment, mandatory, parent_role, "
-        "child_role, cardinality ('0,n', '1,1', ...). Supports dry_run."))
+        "child_role, cardinality ('0,n', '1,1', ...), parent_cardinality. In a "
+        "CDM/LDM the cardinalities map onto the two role cardinalities and "
+        "dependent_role ('A'/'B') marks the dependent side. Supports dry_run."))
     @tool_result
     def update_reference(model_id: str, reference_ref: str, name: str = "", code: str = "",
                          comment: str = "", mandatory: bool = False,
                          parent_role: str = "", child_role: str = "",
-                         cardinality: str = "", dry_run: bool = False) -> dict:
+                         cardinality: str = "", dry_run: bool = False,
+                         parent_cardinality: str = "", dependent_role: str = "") -> dict:
         adapter = backend.connected_adapter()
         updates = {k: v for k, v in (
             ("name", name or None), ("code", code or None), ("comment", comment or None),
             ("mandatory", mandatory or None), ("parent_role", parent_role or None),
-            ("child_role", child_role or None), ("cardinality", cardinality or None)) if v}
+            ("child_role", child_role or None), ("cardinality", cardinality or None),
+            ("parent_cardinality", parent_cardinality or None),
+            ("dependent_role", dependent_role or None)) if v}
         if not updates:
             return {"success": False, "error": {"code": "INVALID_PARAMS",
                                                 "message": "Nothing to update"}}
@@ -266,6 +287,7 @@ def register(mcp, backend: Backend) -> None:
     @mcp.tool(name="create_index", description=(
         "Create an index on a table: normal, unique or composite. Example: "
         "columns=['user_id','create_time'], name='idx_order_user_time'. "
+        "PDM only - indexes are a physical concept and a CDM/LDM is rejected. "
         "Supports dry_run."))
     @tool_result
     def create_index(model_id: str, table_ref: str, columns: list, name: str = "",

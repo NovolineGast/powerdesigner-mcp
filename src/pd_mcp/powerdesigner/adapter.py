@@ -168,7 +168,9 @@ class PowerDesignerAdapter(ABC):
                          child_columns: Optional[List[str]] = None,
                          name: str = "", code: str = "", comment: str = "",
                          cardinality: Optional[str] = None,
-                         update_key: bool = True) -> Dict[str, Any]:
+                         update_key: bool = True,
+                         parent_cardinality: Optional[str] = None,
+                         dependent_role: Optional[str] = None) -> Dict[str, Any]:
         ...
 
     @abstractmethod

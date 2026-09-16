@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from pd_mcp.errors import PdMcpError
+from pd_mcp.errors import InvalidParamsError, PdMcpError
 from pd_mcp.services.inspect import compare_model, inspect_schema, model_snapshot
 from pd_mcp.services.schema_service import (
     apply_schema_patch,
@@ -117,6 +117,73 @@ class TestSchemaOps:
         res = design_from_spec(adapter, spec)
         assert res["success"] and res["created_model"]["kind"] == "PDM"
         assert len(adapter.list_tables(res["model_id"])) == 1
+
+    def test_design_from_spec_cdm(self, adapter):
+        """The whole CDM pipeline must run without a PDM-style index step."""
+        spec = {
+            "model": {"kind": "CDM", "name": "Shop", "code": "shop"},
+            "tables": [
+                {"name": "Customer", "code": "customer",
+                 "columns": [{"code": "customer_id", "data_type": "Integer",
+                              "primary": True},
+                             {"code": "phone", "data_type": "varchar",
+                              "length": 11}]},
+                {"name": "Address", "code": "address",
+                 "columns": [{"code": "address_id", "data_type": "Integer",
+                              "primary": True}]},
+            ],
+            "relationships": [
+                {"parent_table": "customer", "child_table": "address",
+                 "name": "rel_customer_address", "cardinality": "0,n",
+                 "parent_cardinality": "1,1", "dependent_role": "2"},
+            ],
+        }
+        res = design_from_spec(adapter, spec)
+        assert res["success"], res
+        mid = res["model_id"]
+        assert adapter.get_model_info(mid)["kind"] == "CDM"
+
+        cust = adapter.get_table(mid, "customer")
+        assert [c["code"] for c in cust["columns"]] == ["customer_id", "phone"]
+        # primacy is an identifier here, not a per-attribute flag
+        assert cust["primary_key"] is not None
+        assert cust["primary_key"]["code"] == "ID_customer"
+        assert all(c["primary"] is False for c in cust["columns"])
+
+        rel = adapter.list_references(mid)[0]
+        assert rel["code"] == "rel_customer_address"
+        assert rel["cardinality"] == "0,n" and rel["dependent_role"] == "2"
+        assert adapter.list_indexes(mid) == []
+
+    def test_design_from_spec_cdm_plan_uses_entity_vocabulary(self, adapter):
+        spec = {"model": {"kind": "CDM", "name": "S", "code": "s"},
+                "tables": [{"code": "customer",
+                            "columns": [{"code": "customer_id",
+                                         "data_type": "Integer", "primary": True}]}]}
+        res = design_from_spec(adapter, spec, dry_run=True)
+        assert res["dry_run"]
+        assert res["plan"][0] == "CREATE ENTITY customer"
+        assert res["plan"][1] == "ADD ATTRIBUTE customer.customer_id"
+        assert res["plan"][2] == "IDENTIFIER customer(customer_id)"
+
+    def test_design_from_spec_cdm_rejects_indexes(self, adapter):
+        spec = {"model": {"kind": "CDM", "name": "S", "code": "s"},
+                "tables": [{"code": "customer",
+                            "indexes": [{"columns": ["customer_id"]}]}]}
+        with pytest.raises(InvalidParamsError):
+            design_from_spec(adapter, spec, dry_run=True)
+
+    def test_create_database_schema_follows_model_kind(self, adapter):
+        """create_database_schema must not assume PDM on a CDM model."""
+        cdm = adapter.create_model("CDM", "Shop", "shop")["model_id"]
+        res = create_database_schema(
+            adapter, cdm,
+            {"tables": [{"code": "customer",
+                         "columns": [{"code": "customer_id",
+                                      "data_type": "Integer", "primary": True}]}]})
+        assert res["success"], res
+        assert res["executed"][0].startswith("CREATE ENTITY")
+        assert adapter.get_table(cdm, "customer")["primary_key"] is not None
 
 
 class TestValidation:

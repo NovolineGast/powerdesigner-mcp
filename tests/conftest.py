@@ -41,5 +41,28 @@ def pdm(adapter):
 
 
 @pytest.fixture()
+def cdm(adapter):
+    """A CDM with two related entities and a primary identifier each.
+
+    Deliberately built the way the real backend requires: attributes carry no
+    primary flag (primacy comes from create_primary_key / the identifier) and
+    the relationship is a plain association between entities.
+    """
+    mid = adapter.create_model("CDM", "Test Shop", "test_shop")["model_id"]
+    cust = adapter.create_table(mid, "Customer", "customer", "buyers")["ref"]
+    adapter.create_column(mid, cust, {"name": "CustomerId", "code": "customer_id",
+                                      "data_type": "Integer", "mandatory": True})
+    adapter.create_column(mid, cust, {"name": "Phone", "code": "phone",
+                                      "data_type": "Characters(11)"})
+    adapter.create_primary_key(mid, cust, ["customer_id"])
+    addr = adapter.create_table(mid, "Address", "address")["ref"]
+    adapter.create_column(mid, addr, {"name": "AddressId", "code": "address_id",
+                                      "data_type": "Integer", "mandatory": True})
+    adapter.create_primary_key(mid, addr, ["address_id"])
+    adapter.create_reference(mid, cust, addr, name="rel_customer_address")
+    return {"adapter": adapter, "model_id": mid, "customer": cust, "address": addr}
+
+
+@pytest.fixture()
 def txn_manager(adapter, tmp_path):
     return TransactionManager(adapter, tmp_path / "backups")

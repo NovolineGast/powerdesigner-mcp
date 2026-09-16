@@ -24,12 +24,17 @@ def register(mcp, backend: Backend) -> None:
     # High-level schema tools
     # ------------------------------------------------------------------
     @mcp.tool(name="create_database_schema", description=(
-        "Create a whole database schema in one call from a JSON spec: "
+        "Create a whole schema in one call from a JSON spec: "
         "{tables:[{name, code, comment, columns:[{name, code, data_type, length, "
         "precision, mandatory, default_value, comment, primary}], indexes:[...]}], "
         "relationships:[{parent_table, child_table, parent_columns, child_columns, "
-        "name, cardinality}], domains:[...], indexes:[...]}. Primary keys are "
-        "derived from columns with primary:true (or primary_key_columns). "
+        "name, cardinality, parent_cardinality, dependent_role}], domains:[...], "
+        "indexes:[...]}. Primary keys are derived from columns with primary:true "
+        "(or primary_key_columns). The plan follows the target model's kind: in a "
+        "CDM/LDM 'tables' are entities, columns are attributes rendered in "
+        "PowerDesigner's own type vocabulary, primary keys become identifiers, "
+        "relationships become associations (cardinality = child end, "
+        "parent_cardinality = parent end), and index entries are rejected. "
         "dry_run=true returns the execution plan without touching the model; "
         "atomic=true (default) rolls the model back if any step fails."))
     @tool_result

@@ -45,9 +45,23 @@ from ..errors import (
     PdMcpError,
 )
 from .adapter import PowerDesignerAdapter
-from .constants import MODEL_KINDS, PDM_CLASSES, CDM_CLASSES, LDM_CLASSES, PD_CDM_DOMAIN, PD_LDM_DOMAIN, PD_PDM_DOMAIN
+from .constants import (
+    CDM_CLASSES,
+    LDM_CLASSES,
+    MODEL_KINDS,
+    PDM_CLASSES,
+    PD_CDM_DOMAIN,
+    PD_LDM_DOMAIN,
+    PD_PDM_DOMAIN,
+    conceptual_data_type,
+    kind_meta,
+    supports_indexes,
+    uses_conceptual_relationships,
+)
 
 _PROGID_DEFAULT = "PowerDesigner.Application"
+
+log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -222,12 +236,21 @@ class ComDispatcher:
             return
         should_quit = auto_quit == "always" or \
             (auto_quit == "if-launched" and self._we_started)
-        if not should_quit:
-            return
+        if should_quit:
+            try:
+                self.call(self._close_app, timeout=60)
+            except Exception:
+                pass
+        # Release the proxy on this apartment.  Letting the main thread drop it
+        # during interpreter teardown raises CO_E_NOTINITIALIZED (0x800401f0) -
+        # reported by the host as a fatal exception.
         try:
-            self.call(self._close_app, timeout=60)
+            self.call(self._drop_app, timeout=10)
         except Exception:
             pass
+
+    def _drop_app(self) -> None:
+        self._app = None
 
     def _close_app(self) -> bool:
         """Application has no Quit method; close the main window instead."""
@@ -276,9 +299,23 @@ class ComAdapter(PowerDesignerAdapter):
 
     def disconnect(self) -> None:
         if self._disp:
+            # Drop every COM proxy on the apartment that created it.  Releasing
+            # one from a thread that never initialised COM raises
+            # CO_E_NOTINITIALIZED (0x800401f0) - observed as a fatal exception
+            # during interpreter teardown once the dispatcher is gone.
+            try:
+                self._disp.call(self._release_references, timeout=30)
+            except Exception:
+                pass
             self._disp.shutdown(self._config.auto_quit)
             self._disp = None
             self._app = None
+
+    def _release_references(self) -> None:
+        """Drop tracked COM references.  Runs on the dispatcher thread."""
+        self._models.clear()
+        self._refs.clear()
+        self._app = None
 
     def is_connected(self) -> bool:
         return self._disp is not None and self._app is not None
@@ -324,6 +361,34 @@ class ComAdapter(PowerDesignerAdapter):
             raise ObjectNotFoundError(kind, ref, model_id)
         return entry["obj"]
 
+    def _meta_of(self, model_id: str) -> Dict[str, Any]:
+        """Container/capability metadata of the model's kind."""
+        entry = self._models.get(model_id)
+        return MODEL_KINDS[entry["kind"]] if entry else MODEL_KINDS["PDM"]
+
+    def _primary_key_ref(self, model_id: str, obj: Any) -> Any:
+        """Return the key/identifier object the model treats as primary.
+
+        PDM keeps an authoritative ``Primary`` flag on the key; CDM/LDM have
+        no such flag - the entity points at its identifier through
+        ``PrimaryIdentifier`` instead, so ownership has to be walked back.
+        """
+        meta = self._meta_of(model_id)
+        owner = _plain_attr(obj, "Entity", None) or _plain_attr(obj, "Table", None)
+        if owner is None:
+            entry = self._models.get(model_id)
+            if entry is not None:
+                for t in _iter_coll(_safe(entry["obj"], meta["objects_collection"], None)):
+                    for k in _iter_coll(_safe(t, meta["key_coll"], None)):
+                        if _same_com_object(k, obj):
+                            owner = t
+                            break
+                    if owner is not None:
+                        break
+        if owner is None:
+            return None
+        return _safe(owner, meta["pk_owner_prop"], None)
+
     def _resolve(self, model_id: str, kind: str, ident: str,
                  parent_obj: Any = None, coll_name: Optional[str] = None) -> Any:
         """Resolve an object by registered ref first, then by code/name.
@@ -341,24 +406,22 @@ class ComAdapter(PowerDesignerAdapter):
                 return found
         model_entry = self._models.get(model_id)
         if model_entry is not None:
-            root = {"table": MODEL_KINDS[model_entry["kind"]]["objects_collection"],
-                    "reference": MODEL_KINDS[model_entry["kind"]]["ref_collection"],
+            meta = MODEL_KINDS[model_entry["kind"]]
+            root = {"table": meta["objects_collection"],
+                    "reference": meta["ref_collection"],
                     "domain": "Domains",
                     "package": "Packages"}.get(kind)
             if root:
                 found = _find_in_coll(model_entry["obj"], root, ident)
                 if found is not None:
                     return found
-            if kind == "column":
+            # columns/indexes are nested inside each table/entity; the
+            # collection name differs per kind (Columns vs Attributes)
+            nested = {"column": meta["column_coll"], "index": meta["index_coll"]}.get(kind)
+            if nested:
                 for t in _iter_coll(_safe(model_entry["obj"],
-                                          MODEL_KINDS[model_entry["kind"]]["objects_collection"], None)):
-                    found = _find_in_coll(t, "Columns", ident)
-                    if found is not None:
-                        return found
-            if kind == "index":
-                for t in _iter_coll(_safe(model_entry["obj"],
-                                          MODEL_KINDS[model_entry["kind"]]["objects_collection"], None)):
-                    found = _find_in_coll(t, "Indexes", ident)
+                                          meta["objects_collection"], None)):
+                    found = _find_in_coll(t, nested, ident)
                     if found is not None:
                         return found
         raise ObjectNotFoundError(kind, ident, model_id)
@@ -391,9 +454,13 @@ class ComAdapter(PowerDesignerAdapter):
                 "domain": _safe(_safe(obj, "Domain", None), "Code", None),
             })
         if kind == "key":
-            d["primary"] = bool(_safe(obj, "Primary", False))
+            meta = self._meta_of(model_id)
+            if meta["pk_flag_prop"]:
+                d["primary"] = bool(_safe(obj, meta["pk_flag_prop"], False))
+            else:
+                d["primary"] = _same_com_object(self._primary_key_ref(model_id, obj), obj)
             d["columns"] = [self._obj_dict(model_id, "column", c, brief=True)
-                            for c in _iter_coll(_safe(obj, "Columns", None))]
+                            for c in _iter_coll(_safe(obj, meta["column_coll"], None))]
         if kind == "index":
             d["unique"] = bool(_safe(obj, "Unique", False))
             cols = []
@@ -405,18 +472,43 @@ class ComAdapter(PowerDesignerAdapter):
                     cols.append({"name": _safe(ic, "Name", ""), "expression": _safe(ic, "Expression", "")})
             d["columns"] = cols
         if kind == "reference":
-            parent = _safe(obj, "ParentTable", None)
-            child = _safe(obj, "ChildTable", None)
+            meta = self._meta_of(model_id)
+            if meta["ref_style"] == "physical":
+                parent = _safe(obj, "ParentTable", None)
+                child = _safe(obj, "ChildTable", None)
+                d.update({
+                    "mandatory": bool(_safe(obj, "Mandatory", False)),
+                    "parent_role": _safe(obj, "ParentRole", ""),
+                    "child_role": _safe(obj, "ChildRole", ""),
+                    "update_constraint": _safe(obj, "UpdateConstraint", ""),
+                    "delete_constraint": _safe(obj, "DeleteConstraint", ""),
+                })
+            else:
+                # conceptual (CDM/LDM): the ends are Entity1/Entity2 and the
+                # multiplicities are per-direction role cardinalities whose
+                # value syntax is "lo,hi" ("1,1" / "0,n"), not SQL "0..*"
+                parent = _safe(obj, "Entity1", None)
+                child = _safe(obj, "Entity2", None)
+                child_card = _safe(obj, "Entity1ToEntity2RoleCardinality", "")
+                parent_card = _safe(obj, "Entity2ToEntity1RoleCardinality", "")
+                d.update({
+                    "entity1": _safe(parent, "Code", None),
+                    "entity2": _safe(child, "Code", None),
+                    "parent_cardinality": parent_card,
+                    "child_cardinality": child_card,
+                    "cardinality": child_card,
+                    "dependent_role": _safe(obj, "DependentRole", ""),
+                    # role played by Entity1 when read from Entity2, mirroring
+                    # the PDM Parent/ChildRole naming
+                    "parent_role": _plain_attr(obj, "Entity2ToEntity1RoleName", ""),
+                    "child_role": _plain_attr(obj, "Entity1ToEntity2RoleName", ""),
+                    "mandatory": _conceptual_mandatory(parent_card),
+                })
             d.update({
                 "parent_table": _safe(parent, "Code", None),
                 "child_table": _safe(child, "Code", None),
                 "parent_table_ref": self._register(model_id, "table", parent) if parent else None,
                 "child_table_ref": self._register(model_id, "table", child) if child else None,
-                "mandatory": bool(_safe(obj, "Mandatory", False)),
-                "parent_role": _safe(obj, "ParentRole", ""),
-                "child_role": _safe(obj, "ChildRole", ""),
-                "update_constraint": _safe(obj, "UpdateConstraint", ""),
-                "delete_constraint": _safe(obj, "DeleteConstraint", ""),
                 "joins": [],
             })
             for j in _iter_coll(_safe(obj, "Joins", None)):
@@ -426,9 +518,11 @@ class ComAdapter(PowerDesignerAdapter):
                     "child_column": _safe(cc, "Code", "") if cc else "",
                 })
         if kind == "table" and not brief:
-            d["column_count"] = _coll_count(_safe(obj, "Columns", None))
-            d["index_count"] = _coll_count(_safe(obj, "Indexes", None))
-            d["key_count"] = _coll_count(_safe(obj, "Keys", None))
+            meta = self._meta_of(model_id)
+            d["column_count"] = _coll_count(_safe(obj, meta["column_coll"], None))
+            d["index_count"] = (_coll_count(_safe(obj, meta["index_coll"], None))
+                                if meta["index_coll"] else 0)
+            d["key_count"] = _coll_count(_safe(obj, meta["key_coll"], None))
         if kind == "domain":
             d.update({"data_type": _safe(obj, "DataType", ""),
                       "length": _safe(obj, "Length", None),
@@ -461,6 +555,16 @@ class ComAdapter(PowerDesignerAdapter):
                             "domains": "Domains", "packages": "Packages"}}[kind]
         for key, coll in coll_map.items():
             counts[key] = _coll_count(_safe(m, coll, None))
+        # diagram health: content copied without its symbols opens on a blank
+        # diagram, so surface both counts and let callers notice
+        diagrams = _safe(m, MODEL_KINDS[kind]["diagram_collection"], None)
+        counts["diagrams"] = _coll_count(diagrams)
+        counts["symbols"] = 0
+        if counts["diagrams"]:
+            try:
+                counts["symbols"] = _coll_count(_safe(diagrams.Item(0), "Symbols", None))
+            except Exception:
+                pass
         dbms = _safe(_safe(m, "DBMS", None), "Code", "") if kind == "PDM" else ""
         return {"model_id": model_id, "kind": kind,
                 "name": _safe(m, "Name", ""), "code": _safe(m, "Code", ""),
@@ -470,19 +574,33 @@ class ComAdapter(PowerDesignerAdapter):
                 "dbms": dbms, "object_counts": counts}
 
     def _detect_kind(self, m: Any) -> str:
-        ck = _safe(m, "ClassKind", None)
-        if isinstance(ck, int):
-            from .constants import PD_CDM_MODEL, PD_LDM_MODEL
-            if ck == MODEL_KINDS["PDM"]["model_class"]:
-                return "PDM"
-            if ck == PD_CDM_MODEL:
-                return "CDM"
-            if ck == PD_LDM_MODEL:
-                return "LDM"
-        if _safe(m, "Tables", None) is not None:
+        """Classify an open model by its metaclass id.
+
+        ClassKind arrives either as an int or as a numeric string depending on
+        how the proxy was bound (live-verified: a natively generated LDM
+        reported the string '1598421368'), so normalise before comparing.  The
+        collection probes are only a last resort and must not go through
+        ``_safe``, whose GetAttribute fallback answers even for properties the
+        object does not have.
+        """
+        ck = _plain_attr(m, "ClassKind", None)
+        try:
+            ck_int = int(str(ck).strip())
+        except Exception:
+            ck_int = None
+        if ck_int is not None:
+            for kind, meta in MODEL_KINDS.items():
+                if ck_int == meta["model_class"]:
+                    return kind
+        # last resort, most specific container first
+        if _plain_attr(m, "Tables", None) is not None:
             return "PDM"
-        if _safe(m, "Entities", None) is not None:
-            return "LDM"  # refined below via file suffix when known
+        if _plain_attr(m, "LogicalDiagrams", None) is not None:
+            return "LDM"
+        if _plain_attr(m, "ConceptualDiagrams", None) is not None:
+            return "CDM"
+        if _plain_attr(m, "Entities", None) is not None:
+            return "CDM"
         return "PDM"
 
     def _ensure_model_entry(self, m: Any, kind: str) -> str:
@@ -569,6 +687,11 @@ class ComAdapter(PowerDesignerAdapter):
             if not m.CanSave():
                 raise OperationFailedError("Model reports CanSave()=False (read-only?)")
             m.Save()
+            stray = _stray_saved_file(Path(entry["file"]))
+            if stray is not None:
+                log.warning("PowerDesigner wrote the model to %s instead of %s; "
+                            "close and re-open the model to fix the binding",
+                            stray, entry["file"])
             return {"model_id": model_id, "file": entry["file"], "saved": True}
         return self._disp.call(do_save)
 
@@ -624,39 +747,136 @@ class ComAdapter(PowerDesignerAdapter):
                 del self._refs[ref]
             entry["obj"] = m2
             counts = self._copy_content_sync(src_obj, kind, model_id, m2)
+            # symbols attached programmatically land on top of each other
+            laid_out = _auto_layout_first_diagram(m2)
             try:
                 m2.Save()
             except Exception as exc:
                 raise OperationFailedError(f"Saving the re-bound model failed: {exc}")
+            # PD 16.5 normalises FileName on Save and writes the real content to
+            # the bound path *without* its model extension, leaving the
+            # requested file as the ShellNew stub - live-verified for .pdm,
+            # .cdm and .ldm on a freshly bound model.  Promote the real file and
+            # re-open it so the model stays bound to the requested path.
+            # PD 16.5 writes the real content to the extension-less sibling and
+            # leaves the requested file as the ShellNew stub, so the model has
+            # to be closed before the file can be moved into place and re-opened.
+            stray = _stray_saved_file(target)
+            promoted = False
+            if stray is not None:
+                try:
+                    m2.Close()
+                except Exception as exc:
+                    log.warning("could not close the bound model before moving "
+                                "%s: %s", stray, exc)
+                try:
+                    stray.replace(target)
+                    promoted = True
+                except Exception as exc:
+                    log.warning("could not move %s onto %s: %s", stray, target, exc)
+            if promoted:
+                try:
+                    reopened = self._app.OpenModel(str(target), False)
+                except Exception as exc:
+                    reopened = None
+                    log.warning("re-opening %s after the move failed: %s",
+                                target, exc)
+                if reopened is not None:
+                    for ref in [r for r, e in self._refs.items()
+                                if e["model_id"] == model_id]:
+                        del self._refs[ref]
+                    entry["obj"] = reopened
+                else:
+                    log.warning("%s holds the model but it is no longer open; "
+                                "call open_model to continue using it", target)
+            elif stray is not None:
+                log.warning("the saved model is in %s, not in %s", stray, target)
             entry["file"] = str(target)
+            if promoted and entry["obj"] is not src_obj:
+                # the in-memory original is superseded by the verified file-bound
+                # copy; leaving it open is what made PowerDesigner show two
+                # models with the same name
+                try:
+                    src_obj.Close()
+                except Exception as exc:
+                    log.info("could not close the superseded in-memory model: %s", exc)
             return {"model_id": model_id, "file": str(target), "saved": True,
-                    "copied": counts,
-                    "note": "model content copied onto a file-bound model "
-                            "(PowerDesigner has no SaveAs for unsaved models)"}
+                    "copied": counts, "auto_layout": laid_out,
+                    "promoted": promoted,
+                    "note": "model content and diagram symbols copied onto a "
+                            "file-bound model (PowerDesigner has no SaveAs for "
+                            "unsaved models)"}
         return self._disp.call(do_save_as)
+
+    def _copy_identifiers_sync(self, src: Any, dst: Any, kind: str) -> int:
+        """Copy a CDM/LDM entity's identifiers and restore the primary pointer.
+
+        Identifiers are keyed on the entity's ``PrimaryIdentifier`` rather than
+        on a per-attribute flag, so the pointer has to be re-wired after the
+        members have been added - and the target attributes only exist once
+        :meth:`_create_column_on` has run for the entity.  Runs on the COM
+        thread.
+        """
+        meta = MODEL_KINDS[kind]
+        ident_cls = {"CDM": CDM_CLASSES["key"], "LDM": LDM_CLASSES["key"]}[kind]
+        dst_coll = _safe(dst, meta["key_coll"], None)
+        if dst_coll is None:
+            return 0
+        src_primary = _safe(src, meta["pk_owner_prop"], None)
+        count = 0
+        for ident in _iter_coll(_safe(src, meta["key_coll"], None)):
+            new_ident = dst_coll.CreateNew(ident_cls)
+            _set_name_code(new_ident, _safe(ident, "Name", ""), _safe(ident, "Code", ""))
+            for member in _iter_coll(_safe(ident, meta["column_coll"], None)):
+                target = _find_in_coll(dst, meta["column_coll"], _safe(member, "Code", ""))
+                if target is not None:
+                    try:
+                        new_ident.Attributes.Add(target)
+                    except Exception:
+                        pass
+            count += 1
+            if src_primary is not None and _same_com_object(ident, src_primary):
+                _try_set(dst, **{meta["pk_owner_prop"]: new_ident})
+        return count
 
     def _copy_content_sync(self, src_obj: Any, kind: str, model_id: str,
                            dst_obj: Any) -> Dict[str, int]:
-        """Copy all tables/columns/PKs/indexes/references between two open
-        models.  Runs on the COM thread - must not call self._disp.call."""
+        """Copy the whole content of one model onto another of the same kind.
+
+        Tables/entities carry their attributes and keys/identifiers (plus
+        indexes in a PDM); references/relationships are rebuilt in a second
+        pass by code so that the FK migration PowerDesigner performs on the
+        child side cannot race the attribute copy.  Runs on the COM thread -
+        must not call self._disp.call.
+
+        PowerDesigner's content-level copy moves model objects only and does
+        **not** carry diagram symbols, so every object created here is
+        re-attached to the destination's default diagram afterwards; without
+        that the re-bound model opens with a blank diagram (live-verified).
+        """
         meta = MODEL_KINDS[kind]
+        conceptual = meta["ref_style"] == "conceptual"
         counts = {"tables": 0, "columns": 0, "primary_keys": 0, "indexes": 0,
                   "references": 0}
         src_coll = _safe(src_obj, meta["objects_collection"], None)
-        col_classes = {"PDM": PDM_CLASSES["column"], "CDM": CDM_CLASSES["column"],
-                       "LDM": LDM_CLASSES["column"]}
+        new_objects: List[Any] = []
 
-        # pass 1: tables + columns + PK + indexes
+        # pass 1: tables/entities + attributes + keys/identifiers + indexes
         for t in _iter_coll(src_coll):
             tcode = _safe(t, "Code", "")
             nt = dst_obj.CreateObject(meta["object_class"], "", -1, False)
+            if nt is None:
+                raise OperationFailedError(
+                    f"CreateObject returned no object while copying "
+                    f"{tcode or '(unnamed)'}")
             _set_name_code(nt, _safe(t, "Name", tcode), tcode)
             if _safe(t, "Comment", ""):
                 _try_set(nt, Comment=_safe(t, "Comment", ""))
             new_tref = self._register(model_id, "table", nt)
+            new_objects.append(nt)
             counts["tables"] += 1
             pk_codes = []
-            for c in _iter_coll(_safe(t, "Columns", None)):
+            for c in _iter_coll(_safe(t, meta["column_coll"], None)):
                 spec = {"name": _safe(c, "Name", ""), "code": _safe(c, "Code", ""),
                         "data_type": _safe(c, "DataType", ""),
                         "length": _safe(c, "Length", None),
@@ -669,34 +889,64 @@ class ComAdapter(PowerDesignerAdapter):
                     pk_codes.append(spec["code"])
                 self._create_column_on(nt, model_id, spec)
                 counts["columns"] += 1
-            if pk_codes:
-                self._create_primary_key_sync(model_id, new_tref, pk_codes)
-                counts["primary_keys"] += 1
-            for idx in _iter_coll(_safe(t, "Indexes", None)):
-                idx_codes = []
-                for ic in _iter_coll(_safe(idx, "IndexColumns", None)):
-                    col_obj = _safe(ic, "Column", None)
-                    if col_obj is not None:
-                        idx_codes.append(_safe(col_obj, "Code", ""))
-                if idx_codes:
-                    self._create_index_sync(model_id, new_tref, idx_codes,
-                                            name=_safe(idx, "Name", ""),
-                                            unique=bool(_safe(idx, "Unique", False)))
-                    counts["indexes"] += 1
-        # pass 2: references (by codes)
+            if conceptual:
+                if self._copy_identifiers_sync(t, nt, kind):
+                    counts["primary_keys"] += 1
+            else:
+                if pk_codes:
+                    self._create_primary_key_sync(model_id, new_tref, pk_codes)
+                    counts["primary_keys"] += 1
+                for idx in _iter_coll(_safe(t, meta["index_coll"], None)):
+                    idx_codes = []
+                    for ic in _iter_coll(_safe(idx, "IndexColumns", None)):
+                        col_obj = _safe(ic, "Column", None)
+                        if col_obj is not None:
+                            idx_codes.append(_safe(col_obj, "Code", ""))
+                    if idx_codes:
+                        self._create_index_sync(model_id, new_tref, idx_codes,
+                                                name=_safe(idx, "Name", ""),
+                                                unique=bool(_safe(idx, "Unique", False)))
+                        counts["indexes"] += 1
+
+        # pass 2: references/relationships (resolved by code)
         for r in _iter_coll(_safe(src_obj, meta["ref_collection"], None)):
-            parent = _safe(r, "ParentTable", None)
-            child = _safe(r, "ChildTable", None)
-            if parent is None or child is None:
-                continue
             try:
-                self._create_reference_sync(
-                    model_id, _safe(parent, "Code", ""), _safe(child, "Code", ""),
-                    name=_safe(r, "Name", ""), comment=_safe(r, "Comment", ""),
-                    update_key=False)
+                if conceptual:
+                    e1 = _safe(r, "Entity1", None)
+                    e2 = _safe(r, "Entity2", None)
+                    if e1 is None or e2 is None:
+                        continue
+                    copied = self._create_relationship_sync(
+                        model_id, _safe(e1, "Code", ""), _safe(e2, "Code", ""),
+                        name=_safe(r, "Name", ""), code=_safe(r, "Code", ""),
+                        comment=_safe(r, "Comment", ""),
+                        cardinality=_safe(r, "Entity1ToEntity2RoleCardinality", None),
+                        parent_cardinality=_safe(r, "Entity2ToEntity1RoleCardinality", None),
+                        dependent_role=_safe(r, "DependentRole", None))
+                else:
+                    parent = _safe(r, "ParentTable", None)
+                    child = _safe(r, "ChildTable", None)
+                    if parent is None or child is None:
+                        continue
+                    # carrying code/name across keeps the FK constraint naming
+                    # identical (PD would otherwise re-prefix it, FK_FK_xxx)
+                    copied = self._create_reference_sync(
+                        model_id, _safe(parent, "Code", ""), _safe(child, "Code", ""),
+                        name=_safe(r, "Name", ""), code=_safe(r, "Code", ""),
+                        comment=_safe(r, "Comment", ""),
+                        cardinality=_cardinality_string(r), update_key=False)
+                new_objects.append(self._refs[copied["ref"]]["obj"])
                 counts["references"] += 1
-            except Exception:
+            except Exception as exc:
+                log.warning("copy: reference %s skipped: %s",
+                            _safe(r, "Code", "?"), exc)
                 continue
+
+        # the content copy leaves no symbols behind - rebuild them
+        for obj in new_objects:
+            _attach_to_first_diagram(dst_obj, obj)
+        count_attached = len(new_objects)
+        log.info("copy: re-attached symbols for %d objects", count_attached)
         return counts
 
     def close_model(self, model_id: str, save: bool = False) -> Dict[str, Any]:
@@ -774,14 +1024,15 @@ class ComAdapter(PowerDesignerAdapter):
 
         def read():
             obj = self._resolve(model_id, "table", table_ref)
+            meta = self._meta_of(model_id)
             d = self._obj_dict(model_id, kind_word, obj)
             d["columns"] = [self._obj_dict(model_id, "column", c)
-                            for c in _iter_coll(_safe(obj, "Columns", None))]
+                            for c in _iter_coll(_safe(obj, meta["column_coll"], None))]
             d["keys"] = [self._obj_dict(model_id, "key", k)
-                         for k in _iter_coll(_safe(obj, "Keys", None))]
+                         for k in _iter_coll(_safe(obj, meta["key_coll"], None))]
             d["primary_key"] = next((k for k in d["keys"] if k.get("primary")), None)
             d["indexes"] = [self._obj_dict(model_id, "index", i)
-                            for i in _iter_coll(_safe(obj, "Indexes", None))]
+                            for i in _iter_coll(_safe(obj, meta["index_coll"], None))]
             d["references_out"] = [self._obj_dict(model_id, "reference", r)
                                    for r in _iter_coll(_safe(obj, "OutReferences", None))] \
                 if _safe(obj, "OutReferences", None) is not None else []
@@ -850,17 +1101,24 @@ class ComAdapter(PowerDesignerAdapter):
     # columns
     # ------------------------------------------------------------------
     def _create_column_on(self, table_obj: Any, model_id: str, spec: Dict[str, Any]) -> Dict[str, Any]:
-        cls = PDM_CLASSES["column"] if _safe(table_obj, "Columns", None) is not None and \
-            _safe(self._models[model_id]["obj"], "Tables", None) is not None else None
-        # column class is the same numeric id family per kind; resolve via model kind
+        """Add one attribute/column to a table or entity.
+
+        The container is ``Columns`` in a PDM but ``Attributes`` in a
+        CDM/LDM entity, and the data-type vocabulary differs too (DBMS syntax
+        vs PowerDesigner's own).  ``primary`` is only meaningful in a PDM,
+        where it is a flag on the column; in CDM/LDM primacy is expressed by
+        the entity's primary identifier, which :meth:`create_primary_key`
+        builds.
+        """
+        meta = self._meta_of(model_id)
         kind = self._models[model_id]["kind"]
-        from .constants import PD_CDM_ENTITY_ATTRIBUTE, PD_LDM_ENTITY_ATTRIBUTE
-        cls = {"PDM": PDM_CLASSES["column"], "CDM": PD_CDM_ENTITY_ATTRIBUTE,
-               "LDM": PD_LDM_ENTITY_ATTRIBUTE}[kind]
-        coll = _safe(table_obj, "Columns", None)
+        coll = _safe(table_obj, meta["column_coll"], None)
         if coll is None:
-            raise OperationFailedError("Object has no Columns collection")
-        col = coll.CreateNew(cls)
+            raise OperationFailedError(
+                f"Object has no {meta['column_coll']} collection")
+        col = coll.CreateNew({"PDM": PDM_CLASSES["column"],
+                              "CDM": CDM_CLASSES["column"],
+                              "LDM": LDM_CLASSES["column"]}[kind])
         name = spec.get("name") or spec.get("code")
         code = spec.get("code") or name
         _set_name_code(col, name, code)
@@ -868,8 +1126,14 @@ class ComAdapter(PowerDesignerAdapter):
             _try_set(col, DefaultValue=spec["default_value"])
         # Length/Precision must ride on the DataType string; direct
         # Column.Length assignment is a silent no-op on PD 16.5 (live-verified)
-        full_dt = _compose_full_data_type(spec.get("data_type"),
-                                          spec.get("length"), spec.get("precision"))
+        if meta["ref_style"] == "physical":
+            full_dt = _compose_full_data_type(spec.get("data_type"),
+                                              spec.get("length"), spec.get("precision"))
+        else:
+            # CDM/LDM hold PowerDesigner's own type vocabulary
+            # ("Variable characters(20)"), not DBMS column syntax
+            full_dt = conceptual_data_type(spec.get("data_type"),
+                                           spec.get("length"), spec.get("precision"))
         if full_dt:
             _try_set(col, DataType=full_dt)
         if spec.get("mandatory") is not None:
@@ -882,18 +1146,19 @@ class ComAdapter(PowerDesignerAdapter):
             dom = self._resolve_domain(model_id, spec["domain"])
             if dom is not None:
                 _try_set(col, Domain=dom)
-        if spec.get("primary"):
+        if spec.get("primary") and meta["pk_flag_prop"]:
             _try_set(col, Primary=True)
         return self._obj_dict(model_id, "column", col)
 
     def list_columns(self, model_id: str, table_ref: str,
                      query: Optional[str] = None) -> List[Dict[str, Any]]:
         entry = self._model_entry(model_id)
+        coll_name = kind_meta(entry["kind"])["column_coll"]
 
         def read():
             obj = self._resolve(model_id, "table", table_ref)
             out = []
-            for c in _iter_coll(_safe(obj, "Columns", None)):
+            for c in _iter_coll(_safe(obj, coll_name, None)):
                 d = self._obj_dict(model_id, "column", c)
                 if query and query.lower() not in (d["code"] + d["name"]).lower():
                     continue
@@ -909,7 +1174,8 @@ class ComAdapter(PowerDesignerAdapter):
 
         def read():
             table = self._resolve(model_id, "table", table_ref)
-            col = self._resolve(model_id, "column", column_ref, table, "Columns")
+            col = self._resolve(model_id, "column", column_ref, table,
+                                self._meta_of(model_id)["column_coll"])
             return self._obj_dict(model_id, "column", col)
         return self._disp.call(read)
 
@@ -929,7 +1195,8 @@ class ComAdapter(PowerDesignerAdapter):
 
         def do_update():
             table = self._resolve(model_id, "table", table_ref)
-            col = self._resolve(model_id, "column", column_ref, table, "Columns")
+            col = self._resolve(model_id, "column", column_ref, table,
+                                self._meta_of(model_id)["column_coll"])
             name, code = updates.get("name"), updates.get("code")
             if name or code:
                 _set_name_code(col, name or _safe(col, "Name", ""),
@@ -965,7 +1232,8 @@ class ComAdapter(PowerDesignerAdapter):
 
         def do_delete():
             table = self._resolve(model_id, "table", table_ref)
-            col = self._resolve(model_id, "column", column_ref, table, "Columns")
+            col = self._resolve(model_id, "column", column_ref, table,
+                                self._meta_of(model_id)["column_coll"])
             code = _safe(col, "Code", "")
             col.delete()
             for ref in [r for r, e in self._refs.items()
@@ -985,11 +1253,12 @@ class ComAdapter(PowerDesignerAdapter):
     # ------------------------------------------------------------------
     def list_keys(self, model_id: str, table_ref: str) -> List[Dict[str, Any]]:
         entry = self._model_entry(model_id)
+        key_coll = kind_meta(entry["kind"])["key_coll"]
 
         def read():
             obj = self._resolve(model_id, "table", table_ref)
             return [self._obj_dict(model_id, "key", k)
-                    for k in _iter_coll(_safe(obj, "Keys", None))]
+                    for k in _iter_coll(_safe(obj, key_coll, None))]
         return self._disp.call(read)
 
     def create_primary_key(self, model_id: str, table_ref: str, columns: List[str],
@@ -1001,55 +1270,96 @@ class ComAdapter(PowerDesignerAdapter):
 
     def _create_primary_key_sync(self, model_id: str, table_ref: str, columns: List[str],
                                  name: str = "", code: str = "") -> Dict[str, Any]:
+        """Create the primary key (PDM) / primary identifier (CDM, LDM).
+
+        PDM marks primacy with a flag on the key (and tolerates the
+        vendor-sample style of flagging the columns directly).  CDM/LDM
+        attributes carry no flag at all, so an ``Identifier`` must be created
+        and the entity pointed at it through ``PrimaryIdentifier`` -
+        live-verified as the only working route.
+        """
         entry = self._model_entry(model_id)
-        key_cls = {"PDM": PDM_CLASSES["key"]}.get(entry["kind"], PDM_CLASSES["key"])
+        meta = kind_meta(entry["kind"])
+        key_cls = {"PDM": PDM_CLASSES["key"], "CDM": CDM_CLASSES["key"],
+                   "LDM": LDM_CLASSES["key"]}[entry["kind"]]
         if True:  # body runs on the COM thread
             obj = self._resolve(model_id, "table", table_ref)
-            # resolve column objects by code
+            col_coll = meta["column_coll"]
+            member_coll = "Columns" if meta["pk_flag_prop"] else "Attributes"
+            # resolve column/attribute objects by code
             col_objs = []
             for want in columns:
-                found = None
-                for c in _iter_coll(_safe(obj, "Columns", None)):
-                    if _safe(c, "Code", "") == want or _safe(c, "Name", "") == want:
-                        found = c
-                        break
+                found = _find_in_coll(obj, col_coll, want)
                 if found is None:
-                    raise ObjectNotFoundError("Column", want, model_id)
+                    raise ObjectNotFoundError(col_coll[:-1], want, model_id)
                 col_objs.append(found)
-            # clear existing PK membership
-            for c in _iter_coll(_safe(obj, "Columns", None)):
-                if _safe(c, "Primary", False):
-                    _try_set(c, Primary=False)
-            # remove previous PK key objects
-            for k in list(_iter_coll(_safe(obj, "Keys", None))):
-                if _safe(k, "Primary", False):
-                    k.delete()
+            if meta["pk_flag_prop"]:
+                # clear existing PK membership and drop previous PK key objects
+                for c in _iter_coll(_safe(obj, col_coll, None)):
+                    if _safe(c, meta["pk_flag_prop"], False):
+                        _try_set(c, **{meta["pk_flag_prop"]: False})
+                for k in list(_iter_coll(_safe(obj, meta["key_coll"], None))):
+                    if _safe(k, meta["pk_flag_prop"], False):
+                        k.delete()
+            else:
+                # A CDM/LDM identifier cannot be updated in place, and a new one
+                # cannot reuse the old name while it exists ("That name already
+                # exists!", live-verified).  Deleting the superseded identifier
+                # clears the entity's pointer by itself, whereas assigning None
+                # to PrimaryIdentifier raises a type mismatch.
+                prev = _plain_attr(obj, meta["pk_owner_prop"], None)
+                if prev is not None:
+                    try:
+                        prev.delete()
+                    except Exception as exc:
+                        log.warning("could not drop the previous identifier on "
+                                    "%s: %s", _safe(obj, "Code", "?"), exc)
+            keys_coll = _safe(obj, meta["key_coll"], None)
+            if keys_coll is None:
+                raise OperationFailedError(
+                    f"Object has no {meta['key_coll']} collection")
+            # a PDM without an explicit name still has a usable PK via the
+            # column flag, so keep the historical "no name -> no key object"
+            # behaviour there; CDM/LDM *must* materialise the identifier
             key = None
-            keys_coll = _safe(obj, "Keys", None)
-            if name or code:
+            if name or code or not meta["pk_flag_prop"]:
+                default_name = (f"PK_{_safe(obj, 'Code', '')}" if meta["pk_flag_prop"]
+                                else f"ID_{_safe(obj, 'Code', '')}")
+                key_name = name or code or default_name
                 try:
                     key = keys_coll.CreateNew(key_cls)
-                    _set_name_code(key, name or f"PK_{_safe(obj, 'Code', '')}",
-                                   code or name or f"PK_{_safe(obj, 'Code', '')}")
+                    _set_name_code(key, key_name, code or key_name)
                 except Exception:
                     key = None
             if key is not None:
                 for c in col_objs:
                     added = False
                     try:
-                        key.Columns.Add(c)
+                        getattr(key, member_coll).Add(c)
                         added = True
                     except Exception:
                         pass
-                    if not added:
+                    if not added and meta["pk_flag_prop"]:
                         _try_set(c, Primary=True)
-                _try_set(key, Primary=True)
-            else:
-                # vendor-sample style: mark columns Primary directly
-                for c in col_objs:
-                    _try_set(c, Primary=True)
-            if key is not None:
-                return self._obj_dict(model_id, "key", key)
+                if meta["pk_flag_prop"]:
+                    _try_set(key, Primary=True)
+                    return self._obj_dict(model_id, "key", key)
+                _try_set(obj, **{meta["pk_owner_prop"]: key})
+                if not _same_com_object(_plain_attr(obj, meta["pk_owner_prop"], None), key):
+                    # fail loudly: a silently unregistered identifier is
+                    # invisible until conversion stops migrating it
+                    raise OperationFailedError(
+                        f"PowerDesigner did not register the identifier on "
+                        f"{_safe(obj, 'Code', '')}")
+                d = self._obj_dict(model_id, "key", key)
+                d["primary"] = True
+                return d
+            if not meta["pk_flag_prop"]:
+                raise OperationFailedError(
+                    f"Could not create an identifier on {_safe(obj, 'Code', '')}")
+            # vendor-sample style: mark columns Primary directly
+            for c in col_objs:
+                _try_set(c, Primary=True)
             # report resulting PK via first column
             return {"primary_columns": columns, "table": _safe(obj, "Code", "")}
 
@@ -1057,13 +1367,23 @@ class ComAdapter(PowerDesignerAdapter):
         entry = self._model_entry(model_id)
 
         def do_remove():
+            meta = kind_meta(entry["kind"])
             obj = self._resolve(model_id, "table", table_ref)
-            for c in _iter_coll(_safe(obj, "Columns", None)):
-                if _safe(c, "Primary", False):
-                    _try_set(c, Primary=False)
-            for k in list(_iter_coll(_safe(obj, "Keys", None))):
-                if _safe(k, "Primary", False):
-                    k.delete()
+            if meta["pk_flag_prop"]:
+                for c in _iter_coll(_safe(obj, meta["column_coll"], None)):
+                    if _safe(c, meta["pk_flag_prop"], False):
+                        _try_set(c, **{meta["pk_flag_prop"]: False})
+                for k in list(_iter_coll(_safe(obj, meta["key_coll"], None))):
+                    if _safe(k, meta["pk_flag_prop"], False):
+                        k.delete()
+            else:
+                prev = _safe(obj, meta["pk_owner_prop"], None)
+                if prev is not None:
+                    _try_set(obj, **{meta["pk_owner_prop"]: None})
+                    try:
+                        prev.delete()
+                    except Exception:
+                        pass
             return {"removed": "primary_key", "table": _safe(obj, "Code", "")}
         return self._disp.call(do_remove)
 
@@ -1072,12 +1392,13 @@ class ComAdapter(PowerDesignerAdapter):
     # ------------------------------------------------------------------
     def list_references(self, model_id: str) -> List[Dict[str, Any]]:
         entry = self._model_entry(model_id)
-        coll_name = "References" if entry["kind"] == "PDM" else "Relationships"
+        meta = kind_meta(entry["kind"])
 
         def read():
-            kind_word = "reference" if entry["kind"] == "PDM" else "relationship"
-            return [self._obj_dict(model_id, kind_word, r)
-                    for r in _iter_coll(_safe(entry["obj"], coll_name, None))]
+            # the registry kind must match what _resolve/_obj_dict expect,
+            # otherwise refs handed out here cannot be used again
+            return [self._obj_dict(model_id, "reference", r)
+                    for r in _iter_coll(_safe(entry["obj"], meta["ref_collection"], None))]
         return self._disp.call(read)
 
     def get_reference(self, model_id: str, reference_ref: str) -> Dict[str, Any]:
@@ -1093,21 +1414,30 @@ class ComAdapter(PowerDesignerAdapter):
                          child_columns: Optional[List[str]] = None,
                          name: str = "", code: str = "", comment: str = "",
                          cardinality: Optional[str] = None,
-                         update_key: bool = True) -> Dict[str, Any]:
+                         update_key: bool = True,
+                         parent_cardinality: Optional[str] = None,
+                         dependent_role: Optional[str] = None) -> Dict[str, Any]:
         return self._disp.call(lambda: self._create_reference_sync(
             model_id, parent_table, child_table, parent_columns, child_columns,
-            name, code, comment, cardinality, update_key))
+            name, code, comment, cardinality, update_key,
+            parent_cardinality, dependent_role))
 
     def _create_reference_sync(self, model_id: str, parent_table: str, child_table: str,
                                parent_columns: Optional[List[str]] = None,
                                child_columns: Optional[List[str]] = None,
                                name: str = "", code: str = "", comment: str = "",
                                cardinality: Optional[str] = None,
-                               update_key: bool = True) -> Dict[str, Any]:
+                               update_key: bool = True,
+                               parent_cardinality: Optional[str] = None,
+                               dependent_role: Optional[str] = None) -> Dict[str, Any]:
         entry = self._model_entry(model_id)
-        if entry["kind"] != "PDM":
-            raise InvalidParamsError("create_reference applies to PDM models; "
-                                     "use list_relationships for CDM/LDM models")
+        if uses_conceptual_relationships(entry["kind"]):
+            # CDM/LDM describe an association, not a foreign key: columns and
+            # FK migration have no meaning there, so the physical-only
+            # arguments are ignored on purpose
+            return self._create_relationship_sync(
+                model_id, parent_table, child_table, name, code, comment,
+                cardinality, parent_cardinality, dependent_role)
         ref_cls = PDM_CLASSES["reference"]
         join_cls = PDM_CLASSES["reference_join"]
         if True:  # body runs on the COM thread
@@ -1190,10 +1520,60 @@ class ComAdapter(PowerDesignerAdapter):
             _attach_to_first_diagram(m, ref)
             return self._obj_dict(model_id, "reference", ref)
 
+    def _create_relationship_sync(self, model_id: str, entity1: str, entity2: str,
+                                  name: str = "", code: str = "", comment: str = "",
+                                  cardinality: Optional[str] = None,
+                                  parent_cardinality: Optional[str] = None,
+                                  dependent_role: Optional[str] = None) -> Dict[str, Any]:
+        """Create a CDM/LDM relationship, Entity1 -> Entity2.
+
+        PowerDesigner stores conceptual multiplicity as a per-direction role
+        cardinality in ``"lo,hi"`` form (``"1,1"``, ``"0,n"``, ``"1,n"``) -
+        *not* SQL's ``0..*`` spelling; this was live-verified by dissecting the
+        saved ``.cdm`` XML, whose element names map 1:1 onto the automation
+        properties.  Following the PDM convention, ``cardinality`` describes
+        the multiplicity at the Entity2 (child) end - how many Entity2
+        instances one Entity1 may have - while ``parent_cardinality``
+        describes the Entity1 end and defaults to ``1,1``.  Using
+        ``parent_cardinality="0,n"`` on both ends therefore expresses M:N.
+        """
+        entry = self._model_entry(model_id)
+        meta = kind_meta(entry["kind"])
+        ref_cls = {"CDM": CDM_CLASSES["reference"],
+                   "LDM": LDM_CLASSES["reference"]}[entry["kind"]]
+        if True:  # body runs on the COM thread
+            m = entry["obj"]
+            e1 = _find_in_coll(m, meta["objects_collection"], entity1)
+            e2 = _find_in_coll(m, meta["objects_collection"], entity2)
+            if e1 is None:
+                raise ObjectNotFoundError("Entity", entity1, model_id)
+            if e2 is None:
+                raise ObjectNotFoundError("Entity", entity2, model_id)
+            ref = m.Relationships.CreateNew(ref_cls)
+            ref_name = name or code or f"rel_{_safe(e1, 'Code', '')}_{_safe(e2, 'Code', '')}"
+            _set_name_code(ref, ref_name, code or ref_name)
+            if comment:
+                _try_set(ref, Comment=comment)
+            _try_set(ref, Entity1=e1)
+            _try_set(ref, Entity2=e2)
+            child_card = _normalize_cardinality(cardinality) or "0,n"
+            parent_card = _normalize_cardinality(parent_cardinality) or "1,1"
+            _try_set(ref, Entity1ToEntity2RoleCardinality=child_card)
+            _try_set(ref, Entity2ToEntity1RoleCardinality=parent_card)
+            side = _resolve_dependent_side(dependent_role, e1, e2)
+            if side:
+                _try_set(ref, DependentRole=side)
+            _attach_to_first_diagram(m, ref)
+            d = self._obj_dict(model_id, "reference", ref)
+            d["cardinality"] = child_card
+            d["parent_cardinality"] = parent_card
+            return d
+
     def update_reference(self, model_id: str, reference_ref: str, updates: Dict[str, Any]) -> Dict[str, Any]:
-        self._model_entry(model_id)
+        entry = self._model_entry(model_id)
 
         def do_update():
+            meta = kind_meta(entry["kind"])
             ref = self._resolve(model_id, "reference", reference_ref)
             name, code = updates.get("name"), updates.get("code")
             if name or code:
@@ -1202,19 +1582,36 @@ class ComAdapter(PowerDesignerAdapter):
             kwargs: Dict[str, Any] = {}
             if updates.get("comment") is not None:
                 kwargs["Comment"] = updates["comment"]
-            if updates.get("mandatory") is not None:
-                kwargs["Mandatory"] = bool(updates["mandatory"])
-            if updates.get("parent_role") is not None:
-                kwargs["ParentRole"] = updates["parent_role"]
-            if updates.get("child_role") is not None:
-                kwargs["ChildRole"] = updates["child_role"]
-            if updates.get("cardinality"):
-                try:
-                    lo, hi = str(updates["cardinality"]).split(",")
-                    kwargs["MinimumCardinality"] = lo.strip()
-                    kwargs["MaximumCardinality"] = hi.strip()
-                except Exception:
-                    pass
+            if meta["ref_style"] == "physical":
+                if updates.get("mandatory") is not None:
+                    kwargs["Mandatory"] = bool(updates["mandatory"])
+                if updates.get("parent_role") is not None:
+                    kwargs["ParentRole"] = updates["parent_role"]
+                if updates.get("child_role") is not None:
+                    kwargs["ChildRole"] = updates["child_role"]
+                if updates.get("cardinality"):
+                    try:
+                        lo, hi = str(updates["cardinality"]).split(",")
+                        kwargs["MinimumCardinality"] = lo.strip()
+                        kwargs["MaximumCardinality"] = hi.strip()
+                    except Exception:
+                        pass
+            else:
+                if updates.get("parent_role") is not None:
+                    kwargs["Entity2ToEntity1RoleName"] = updates["parent_role"]
+                if updates.get("child_role") is not None:
+                    kwargs["Entity1ToEntity2RoleName"] = updates["child_role"]
+                card = _normalize_cardinality(updates.get("cardinality"))
+                if card:
+                    kwargs["Entity1ToEntity2RoleCardinality"] = card
+                card = _normalize_cardinality(updates.get("parent_cardinality"))
+                if card:
+                    kwargs["Entity2ToEntity1RoleCardinality"] = card
+                side = _resolve_dependent_side(
+                    updates.get("dependent_role"),
+                    _safe(ref, "Entity1", None), _safe(ref, "Entity2", None))
+                if side:
+                    kwargs["DependentRole"] = side
             _try_set(ref, **kwargs)
             return self._obj_dict(model_id, "reference", ref)
         return self._disp.call(do_update)
@@ -1237,32 +1634,53 @@ class ComAdapter(PowerDesignerAdapter):
     # ------------------------------------------------------------------
     def list_indexes(self, model_id: str, table_ref: Optional[str] = None) -> List[Dict[str, Any]]:
         entry = self._model_entry(model_id)
+        meta = kind_meta(entry["kind"])
 
         def read():
             out = []
+            if not meta["index_coll"]:
+                return out
             if table_ref:
                 obj = self._resolve(model_id, "table", table_ref)
-                for i in _iter_coll(_safe(obj, "Indexes", None)):
+                for i in _iter_coll(_safe(obj, meta["index_coll"], None)):
                     out.append(self._obj_dict(model_id, "index", i))
             else:
-                for t in _iter_coll(_safe(entry["obj"], "Tables", None)):
-                    for i in _iter_coll(_safe(t, "Indexes", None)):
+                for t in _iter_coll(_safe(entry["obj"], meta["objects_collection"], None)):
+                    for i in _iter_coll(_safe(t, meta["index_coll"], None)):
                         out.append(self._obj_dict(model_id, "index", i, brief=True))
             return out
         return self._disp.call(read)
+
+    def _require_index_support(self, model_id: str) -> Dict[str, Any]:
+        """Indexes are a physical concept; guard CDM/LDM with a clear error.
+
+        Raising here (rather than letting the COM call fail with an opaque
+        AttributeError) is what keeps the mock and the real backend honest
+        about the same capability boundary.
+        """
+        meta = self._meta_of(model_id)
+        if not meta["index_coll"]:
+            kind = self._models.get(model_id, {}).get("kind", "?")
+            raise InvalidParamsError(
+                f"Indexes do not exist in a {kind} model - they are a physical "
+                "(PDM) concept. Convert to a PDM first, or use keys/identifiers.")
+        return meta
 
     def get_index(self, model_id: str, table_ref: str, index_ref: str) -> Dict[str, Any]:
         self._model_entry(model_id)
 
         def read():
+            meta = self._require_index_support(model_id)
             table = self._resolve(model_id, "table", table_ref)
-            idx = self._resolve(model_id, "index", index_ref, table, "Indexes")
+            idx = self._resolve(model_id, "index", index_ref, table, meta["index_coll"])
             return self._obj_dict(model_id, "index", idx)
         return self._disp.call(read)
 
     def create_index(self, model_id: str, table_ref: str, columns: List[str],
                      name: str = "", code: str = "", unique: bool = False,
                      comment: str = "") -> Dict[str, Any]:
+        self._model_entry(model_id)
+        self._require_index_support(model_id)
         if not columns:
             raise InvalidParamsError("Index needs at least one column")
         return self._disp.call(lambda: self._create_index_sync(
@@ -1274,6 +1692,7 @@ class ComAdapter(PowerDesignerAdapter):
         idx_cls = PDM_CLASSES["index"]
         idx_col_cls = PDM_CLASSES["index_column"]
         if True:  # body runs on the COM thread
+            meta = self._meta_of(model_id)
             table = self._resolve(model_id, "table", table_ref)
             idx = table.Indexes.CreateNew(idx_cls)
             idx_name = name or ("idx_" + "_".join(columns))
@@ -1283,9 +1702,9 @@ class ComAdapter(PowerDesignerAdapter):
             if comment:
                 _try_set(idx, Comment=comment)
             for col_code in columns:
-                col = _find_in_coll(table, "Columns", col_code)
+                col = _find_in_coll(table, meta["column_coll"], col_code)
                 if col is None:
-                    raise ObjectNotFoundError("Column", col_code, model_id)
+                    raise ObjectNotFoundError(meta["column_coll"][:-1], col_code, model_id)
                 ic = idx.IndexColumns.CreateNew(idx_col_cls)
                 _try_set(ic, Column=col)
             return self._obj_dict(model_id, "index", idx)
@@ -1293,10 +1712,12 @@ class ComAdapter(PowerDesignerAdapter):
     def update_index(self, model_id: str, table_ref: str, index_ref: str,
                      updates: Dict[str, Any]) -> Dict[str, Any]:
         self._model_entry(model_id)
+        self._require_index_support(model_id)
 
         def do_update():
+            meta = self._meta_of(model_id)
             table = self._resolve(model_id, "table", table_ref)
-            idx = self._resolve(model_id, "index", index_ref, table, "Indexes")
+            idx = self._resolve(model_id, "index", index_ref, table, meta["index_coll"])
             name, code = updates.get("name"), updates.get("code")
             if name or code:
                 _set_name_code(idx, name or _safe(idx, "Name", ""),
@@ -1317,7 +1738,7 @@ class ComAdapter(PowerDesignerAdapter):
                 except Exception:
                     pass
                 for col_code in updates["columns"]:
-                    col = _find_in_coll(table, "Columns", col_code)
+                    col = _find_in_coll(table, meta["column_coll"], col_code)
                     ic = idx.IndexColumns.CreateNew(PDM_CLASSES["index_column"])
                     _try_set(ic, Column=col)
             return self._obj_dict(model_id, "index", idx)
@@ -1325,6 +1746,7 @@ class ComAdapter(PowerDesignerAdapter):
 
     def delete_index(self, model_id: str, table_ref: str, index_ref: str) -> Dict[str, Any]:
         self._model_entry(model_id)
+        self._require_index_support(model_id)
 
         def do_delete():
             idx = self._resolve(model_id, "index", index_ref)
@@ -1468,32 +1890,57 @@ class ComAdapter(PowerDesignerAdapter):
                 f"Conversion {src_kind}->{target_kind} not supported "
                 "(CDM->LDM, CDM->PDM, LDM->PDM)")
 
-        # 1) try native generation (GeneratePhysicalDataModel / GenerateLogicalDataModel)
+        # 1) try native generation.  PD 16.5 has no GeneratePhysicalDataModel /
+        #    GenerateLogicalDataModel member at all (live-verified); the generic
+        #    GenerateModel(ObjectSelection, Kind, Target, SaveDependencies) is the
+        #    only route that applies PowerDesigner's own mapping rules - including
+        #    the identifier->FK migration a course design depends on.
+        #
+        #    Classification and registration happen *inside* the COM call:
+        #    inspecting the freshly generated model from another thread made
+        #    _detect_kind() report PDM for a native LDM (live-verified), because
+        #    a marshalled proxy answers differently from an in-apartment object.
         def try_native():
             m = entry["obj"]
-            for method in ("GeneratePhysicalDataModel", "GenerateLogicalDataModel"):
-                want_phys = target_kind == "PDM"
-                if (method == "GeneratePhysicalDataModel") != want_phys:
-                    continue
-                fn = getattr(m, method, None)
-                if fn is None:
-                    continue
-                for args in ((), (dbms or "",) if dbms else ()):
-                    try:
-                        new_m = fn(*args) if args else fn()
-                        if new_m is not None:
-                            return new_m
-                    except Exception:
+            target_class = MODEL_KINDS[target_kind]["model_class"]
+            new_m = None
+            try:
+                raw = _generate_model_via_invoke(m, target_class, "")
+                if raw is not None:
+                    from win32com.client import dynamic
+                    new_m = dynamic.Dispatch(raw)
+            except Exception as exc:
+                log.info("native GenerateModel(%s) failed, falling back: %s",
+                         target_kind, exc)
+            if new_m is None:
+                for method in ("GeneratePhysicalDataModel", "GenerateLogicalDataModel"):
+                    want_phys = target_kind == "PDM"
+                    if (method == "GeneratePhysicalDataModel") != want_phys:
                         continue
-            return None
-
-        new_m = self._disp.call(try_native)
-        if new_m is not None:
+                    fn = getattr(m, method, None)
+                    if fn is None:
+                        continue
+                    for args in ((), (dbms or "",) if dbms else ()):
+                        try:
+                            candidate = fn(*args) if args else fn()
+                        except Exception:
+                            continue
+                        if candidate is not None:
+                            new_m = candidate
+                            break
+                    if new_m is not None:
+                        break
+            if new_m is None:
+                return None
             kind = self._detect_kind(new_m)
-            mid = self._ensure_model_entry(new_m, kind)
-            info = self._disp.call(lambda: self._model_info_from_obj(new_m))
-            return {"source_model_id": model_id, "target_kind": kind,
-                    "engine": "powerdesigner-native", "target_model": info}
+            self._ensure_model_entry(new_m, kind)
+            return {"kind": kind, "info": self._model_info_from_obj(new_m)}
+
+        native = self._disp.call(try_native)
+        if native is not None:
+            return {"source_model_id": model_id, "target_kind": native["kind"],
+                    "engine": "powerdesigner-native",
+                    "target_model": native["info"]}
 
         # 2) structured fallback conversion via adapter-level mapping
         result = fallback_convert(self, model_id, target_kind, dbms)
@@ -1565,7 +2012,6 @@ def _safe(obj: Any, attr: str, default: Any = None) -> Any:
 
 
 def _try_set(obj: Any, **kwargs: Any) -> None:
-    log = logging.getLogger(__name__)
     for attr, value in kwargs.items():
         try:
             setattr(obj, attr, value)
@@ -1675,6 +2121,44 @@ def _model_file(m: Any) -> Optional[str]:
         return None
 
 
+def _stray_saved_file(target: Path) -> Optional[Path]:
+    """Path of the extension-less file PowerDesigner wrote instead of *target*.
+
+    PD 16.5 normalises ``FileName`` on Save and writes the model to the bound
+    path with its model extension stripped, leaving the requested file as the
+    ShellNew stub (live-verified for .pdm, .cdm and .ldm: a 50 KB model landed
+    in ``a_model`` beside a 1.9 KB ``a_model.pdm``).  Detection only - the
+    caller has to close the model before the file can be moved, since PD keeps
+    a handle on it.
+    """
+    stray = target.with_suffix("")
+    try:
+        if stray.is_file() and target.is_file() and \
+                stray.stat().st_size > target.stat().st_size:
+            return stray
+    except Exception as exc:
+        log.warning("could not inspect %s: %s", stray, exc)
+    return None
+
+
+def _generate_model_via_invoke(model_obj: Any, model_class: int,
+                               target: str = "") -> Any:
+    """``GenerateModel(ObjectSelection, Kind, Target, SaveDependencies)``.
+
+    The signature comes from the PD 16.5 typelib (dispid 33554819).  pywin32
+    cannot marshal the optional arguments of this member or of its wrappers
+    ("The Python instance can not be converted to a COM object"), so the call
+    goes through the raw IDispatch - the same pattern as GenerateDatabase and
+    AttachLinkObject.  Returns a raw IDispatch pointer (dispatch it with
+    ``win32com.client.dynamic.Dispatch``).
+    """
+    import pythoncom
+    ole = model_obj._oleobj_
+    return ole.InvokeTypes(33554819, 0, pythoncom.DISPATCH_METHOD, (9, 2),
+                           ((9, 49), (3, 49), (8, 49), (11, 49)),
+                           None, model_class, target, True)
+
+
 def _attach_link_via_invoke(diagram: Any, obj: Any) -> bool:
     """Diagram.AttachLinkObject via raw IDispatch.
 
@@ -1695,18 +2179,162 @@ def _attach_link_via_invoke(diagram: Any, obj: Any) -> bool:
         return False
 
 
-def _attach_to_first_diagram(model_obj: Any, obj: Any) -> None:
-    """Attach a symbol so the object is visible in the default diagram."""
+def _attach_to_first_diagram(model_obj: Any, obj: Any, link: Optional[bool] = None) -> None:
+    """Attach a symbol so the object is visible in the default diagram.
+
+    ``link`` selects the AttachLinkObject route; when left unset it is inferred
+    from the object shape.  A CDM relationship has no ``Joins`` collection, so
+    inferring on ``Joins`` alone would send it down the silent AttachObject
+    path and drop the relationship line from the diagram.
+    """
+    if link is None:
+        link = any(_has_attr(obj, attr) for attr in ("Joins", "Entity1", "Entity2"))
     for attr in ("PhysicalDiagrams", "ConceptualDiagrams", "LogicalDiagrams"):
         diagrams = _safe(model_obj, attr, None)
         if diagrams is not None:
             try:
                 diagram = diagrams.Item(0)
                 attached = False
-                if hasattr(obj, "Joins"):
+                if link:
                     attached = _attach_link_via_invoke(diagram, obj)
                 if not attached:
                     diagram.AttachObject(obj)
             except Exception:
                 pass
             return
+
+
+def _auto_layout_first_diagram(model_obj: Any) -> bool:
+    """Best-effort AutoLayout on the default diagram.
+
+    Symbols attached programmatically land on top of each other; AutoLayout is
+    called through the raw IDispatch because pywin32 cannot build its optional
+    arguments - the same limitation as GenerateDatabase/AttachLinkObject.
+    """
+    for attr in ("PhysicalDiagrams", "ConceptualDiagrams", "LogicalDiagrams"):
+        diagrams = _safe(model_obj, attr, None)
+        if diagrams is None:
+            continue
+        try:
+            import pythoncom
+            diagram = diagrams.Item(0)
+            ole = diagram._oleobj_
+            dispid = ole.GetIDsOfNames(0, "AutoLayout")
+            ole.Invoke(dispid, 0, pythoncom.DISPATCH_METHOD, False)
+            return True
+        except Exception:
+            return False
+    return False
+
+
+def _plain_attr(obj: Any, attr: str, default: Any = None) -> Any:
+    """``getattr`` without :func:`_safe`'s GetAttribute fallback.
+
+    GetAttribute answers for properties that do not exist, so ``_safe`` cannot
+    be used to test whether a collection is really there - live-verified: an
+    LDM and a CDM both came back as "PDM" because ``_safe(m, "Tables")``
+    returned a value on models that have no Tables collection at all.
+    """
+    if obj is None:
+        return default
+    try:
+        value = getattr(obj, attr, None)
+        return default if value is None else value
+    except Exception:
+        return default
+
+
+def _object_identity(obj: Any) -> Optional[str]:
+    """Stable identity of a COM object, as a string.
+
+    pywin32 hands back a fresh proxy on every enumeration, so ``is`` is
+    useless.  ObjectID is the documented identity but its *type* varies by
+    metaclass - models report an integer while CDM identifiers report a GUID
+    string (live-verified) - hence the string form.
+    """
+    if obj is None:
+        return None
+    value = _plain_attr(obj, "ObjectID", None)
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
+
+
+def _same_com_object(a: Any, b: Any) -> bool:
+    ia, ib = _object_identity(a), _object_identity(b)
+    if ia is None or ib is None:
+        return a is b
+    return ia == ib
+
+
+def _has_attr(obj: Any, attr: str) -> bool:
+    """True when the property exists *and* holds a value."""
+    return _plain_attr(obj, attr, None) is not None
+
+
+# SQL-style multiplicities mapped onto PowerDesigner's conceptual "lo,hi"
+# spelling (the only form the CDM/LDM role-cardinality properties accept)
+_CARDINALITY_ALIASES = {
+    "*": "0,n", "n": "0,n", "0..*": "0,n", "0..n": "0,n", "0,n": "0,n",
+    "1..*": "1,n", "1..n": "1,n", "1,n": "1,n",
+    "0..1": "0,1", "0,1": "0,1",
+    "1": "1,1", "1..1": "1,1", "1,1": "1,1",
+}
+
+
+def _normalize_cardinality(value: Any) -> Optional[str]:
+    """Normalise a multiplicity to PowerDesigner's conceptual "lo,hi" form."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text in _CARDINALITY_ALIASES:
+        return _CARDINALITY_ALIASES[text]
+    if "," in text:
+        return text
+    if ".." in text:
+        lo, _, hi = text.partition("..")
+        hi = {"*": "n"}.get(hi.strip(), hi.strip())
+        return f"{lo.strip()},{hi}"
+    if text.isdigit():
+        return text
+    return None
+
+
+def _resolve_dependent_side(value: Any, entity1: Any, entity2: Any) -> Optional[str]:
+    """Map a user-facing dependent side onto PD's DependentRole ("A"/"B").
+
+    Accepts "A"/"B" directly, "1"/"2" for Entity1/Entity2, or the code/name of
+    one of the two entities.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if text.upper() in ("A", "B"):
+        return text.upper()
+    if text in ("1", "2"):
+        return "A" if text == "1" else "B"
+    for side, ent in (("A", entity1), ("B", entity2)):
+        if ent is not None and text in (_safe(ent, "Code", ""), _safe(ent, "Name", "")):
+            return side
+    return None
+
+
+def _conceptual_mandatory(parent_cardinality: Any) -> bool:
+    """True when the Entity1 end is "1,x": each Entity2 needs exactly one Entity1.
+
+    That is the conceptual equivalent of a NOT NULL foreign key in the PDM the
+    model converts into.
+    """
+    return str(parent_cardinality or "").strip().startswith("1")
+
+
+def _cardinality_string(ref: Any) -> Optional[str]:
+    """Recompose a PDM reference cardinality from its min/max components."""
+    lo = _safe(ref, "MinimumCardinality", None)
+    hi = _safe(ref, "MaximumCardinality", None)
+    if lo is None and hi is None:
+        return None
+    return f"{lo if lo is not None else 0},{hi if hi is not None else 'n'}"

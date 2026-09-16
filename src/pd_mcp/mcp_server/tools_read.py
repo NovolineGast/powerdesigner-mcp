@@ -46,7 +46,8 @@ def register(mcp, backend: Backend) -> None:
         return {"success": True, "query": query, "model_id": model_id, **paged}
 
     @mcp.tool(name="list_columns", description=(
-        "List columns of a table with full attributes. Optional text search."))
+        "List the columns of a table (the attributes of a CDM/LDM entity) with "
+        "full attributes. Optional text search."))
     @tool_result
     def list_columns(model_id: str, table_ref: str, query: str = "") -> dict:
         adapter = backend.connected_adapter()

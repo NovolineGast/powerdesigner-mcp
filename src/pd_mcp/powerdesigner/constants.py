@@ -9,6 +9,10 @@ and cross-checked against the official C# sample
 
 from __future__ import annotations
 
+from typing import Any, Dict, Optional
+
+from ..errors import InvalidParamsError
+
 # --- metaclass ids (VBScriptConstants.vbs) ---------------------------------
 PD_PDM_MODEL = -840675807        # Physical Data Model
 PD_PDM_PACKAGE = -840675806
@@ -80,6 +84,14 @@ MODEL_KINDS = {
         "object_class": PD_PDM_TABLE,
         "objects_collection": "Tables",
         "ref_collection": "References",
+        # container / capability metadata (see the note above)
+        "object_word": "table",
+        "column_coll": "Columns",
+        "key_coll": "Keys",
+        "index_coll": "Indexes",
+        "pk_flag_prop": "Primary",         # flag lives on the key object
+        "pk_owner_prop": "PrimaryKey",     # back-pointer lives on the table
+        "ref_style": "physical",           # ParentTable/ChildTable/Joins/ParentKey
     },
     "CDM": {
         "model_class": PD_CDM_MODEL,
@@ -88,6 +100,13 @@ MODEL_KINDS = {
         "object_class": PD_CDM_ENTITY,
         "objects_collection": "Entities",
         "ref_collection": "Relationships",
+        "object_word": "entity",
+        "column_coll": "Attributes",
+        "key_coll": "Identifiers",
+        "index_coll": None,
+        "pk_flag_prop": None,              # attributes have no Primary flag
+        "pk_owner_prop": "PrimaryIdentifier",
+        "ref_style": "conceptual",         # Entity1/Entity2 + RoleCardinality
     },
     "LDM": {
         "model_class": PD_LDM_MODEL,
@@ -96,5 +115,84 @@ MODEL_KINDS = {
         "object_class": PD_LDM_ENTITY,
         "objects_collection": "Entities",
         "ref_collection": "Relationships",
+        "object_word": "entity",
+        "column_coll": "Attributes",
+        "key_coll": "Identifiers",
+        "index_coll": None,
+        "pk_flag_prop": None,
+        "pk_owner_prop": "PrimaryIdentifier",
+        "ref_style": "conceptual",
     },
 }
+
+
+def kind_meta(kind: str) -> Dict[str, Any]:
+    """Container/capability metadata for a model kind (PDM/CDM/LDM)."""
+    try:
+        return MODEL_KINDS[kind.upper()]
+    except KeyError:
+        raise InvalidParamsError(
+            f"Unsupported model kind '{kind}'; expected one of "
+            f"{', '.join(sorted(MODEL_KINDS))}")
+
+
+def supports_indexes(kind: str) -> bool:
+    return kind_meta(kind)["index_coll"] is not None
+
+
+def uses_conceptual_relationships(kind: str) -> bool:
+    return kind_meta(kind)["ref_style"] == "conceptual"
+
+
+# --- conceptual (CDM/LDM) data types ---------------------------------------
+#
+# CDM/LDM do not use DBMS column syntax: PD stores its own type vocabulary
+# ("Characters(12)", "Variable characters(20)", "Decimal(6,2)", "Timestamp")
+# and maps it per target DBMS at generation time.  Passing SQL syntax through
+# verbatim yields an "unknown datatype" check error, so common SQL spellings
+# are translated here (values live-verified against the .cdm produced by
+# PowerDesigner for the campus-canteen course design).
+_CONCEPTUAL_TYPE_ALIASES = {
+    "int": "Integer", "integer": "Integer", "serial": "Integer",
+    "bigint": "Long integer", "long": "Long integer",
+    "smallint": "Short integer", "tinyint": "Byte", "byte": "Byte",
+    "bit": "Boolean", "bool": "Boolean", "boolean": "Boolean",
+    "float": "Float", "real": "Float", "double": "Float",
+    "date": "Date", "time": "Time",
+    "datetime": "Date & Time", "timestamp": "Timestamp",
+    "text": "Text", "longtext": "Text", "clob": "Text", "mediumtext": "Text",
+    "blob": "Binary", "binary": "Binary", "varbinary": "Binary",
+    "varchar": "Variable characters", "nvarchar": "Variable characters",
+    "varchar2": "Variable characters", "char": "Characters",
+    "nchar": "Characters", "character": "Characters",
+    "decimal": "Decimal", "numeric": "Decimal", "number": "Number",
+    "money": "Decimal",
+}
+_LENGTH_FAMILIES = {"Characters", "Variable characters", "Binary"}
+_SCALE_FAMILIES = {"Decimal"}
+
+
+def conceptual_data_type(base: Any, length: Any = None,
+                         precision: Any = None) -> Optional[str]:
+    """Render a CDM/LDM attribute data type from SQL-ish input.
+
+    ``base`` may already be a PD type ("Variable characters(20)"), in which
+    case it is returned untouched; otherwise common SQL spellings are mapped
+    onto the PD vocabulary and the length/scale is folded into the string.
+    """
+    if base is None or str(base).strip() == "":
+        return None
+    text = str(base).strip()
+    if "(" in text:                       # already a sized PD type
+        return text
+    family = _CONCEPTUAL_TYPE_ALIASES.get(text.lower())
+    if family is None:                    # unknown: keep the author's spelling
+        family = text
+    if length and family in _LENGTH_FAMILIES:
+        return f"{family}({int(length)})"
+    if precision and family in _SCALE_FAMILIES:
+        n = int(length) if length else 10
+        return f"{family}({n},{int(precision)})"
+    if length and family in _SCALE_FAMILIES:
+        return f"{family}({int(length)})"
+    return family

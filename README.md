@@ -227,9 +227,14 @@ PowerDesigner license.
   machine-readable findings come from `validate_model` / `check_database_design`.
 - PowerDesigner has **no SaveAs**: saving an unsaved model to a new path is
   implemented via ShellNew-template file binding + content copy (returns a
-  `copied` summary).
-- CDM inheritance is not exposed yet (entities/attributes/identifiers/
-  relationships are); the adapter interface makes adding it straightforward.
+  `copied` summary). Diagram symbols are re-attached and auto-laid-out as part
+  of the copy, and the saved file is verified to hold the model rather than the
+  ShellNew stub (PD 16.5 sometimes writes to an extension-less sibling).
+- CDM/LDM are first-class: entities/attributes, identifiers (primaries), and
+  conceptual relationships with per-end cardinalities and a dependent side.
+  Indexes are a physical concept, so index tools reject a CDM/LDM explicitly.
+- CDM inheritance is not exposed yet; the adapter interface makes adding it
+  straightforward.
 - Generating for a DBMS different from the model's DBMS returns a clear error —
   use `create_model(dbms=...)` / `ChangeDBMS` first.
 
@@ -401,9 +406,12 @@ Mock 后端复刻 PowerDesigner 语义（列 Primary 主键、引用 FK 迁移�
 - 16.5 的 `CheckModel()` 返回 `None`（结果进 PD Result List 窗口）；机器可读的
   检查结果由 `validate_model` / `check_database_design` 提供。
 - PowerDesigner **没有 SaveAs**：未保存模型另存通过 ShellNew 模板文件绑定 +
-  内容复制实现（返回 `copied` 统计）。
-- CDM 继承（Inheritance）暂未暴露（实体/属性/标识符/关系已支持）；
-  Adapter 接口使补充实现非常直接。
+  内容复制实现（返回 `copied` 统计）。复制过程会重新挂载图符号并自动布局，
+  且会校验请求路径确实拿到模型内容而非模板壳（PD 16.5 有时会把内容写到
+  去掉扩展名的同级文件）。
+- CDM/LDM 为一等公民：实体/属性、标识符（主标识）、概念联系（两端基数 +
+  依赖侧）。索引属物理概念，索引类工具对 CDM/LDM 显式报错。
+- CDM 继承（Inheritance）暂未暴露；Adapter 接口使补充实现非常直接。
 - 生成与模型 DBMS 不符的 SQL 会返回明确错误——请先 `create_model(dbms=...)`
   或 ChangeDBMS。
 
