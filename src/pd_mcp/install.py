@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -141,17 +142,23 @@ def uv_tool_script(name: str = "powerdesigner-mcp") -> Optional[Path]:
     return None
 
 
+# uv keeps throw-away environments under these cache subdirectories; the version
+# suffix moves between uv releases, hence a pattern rather than exact names
+_EPHEMERAL_DIRS = re.compile(r"\\(?:archive|environments|builds|wheels)-v\d+\\")
+
+
 def is_ephemeral_runtime(exe: Optional[str] = None) -> bool:
-    """True when the interpreter lives in a throw-away uv/uvx cache env.
+    """True when the interpreter/launcher lives in a throw-away uv cache env.
 
     Registering such a path produces a config that breaks as soon as the cache
     is pruned, which is exactly the kind of thing that makes a hand-written
     MCP entry rot - so it is refused instead.
     """
     path = str(exe or sys.executable).lower().replace("/", "\\")
-    return ("\\uv\\cache\\" in path
-            and any(marker in path for marker in
-                    ("archive-v", "environments-v", "builds-v", "wheels-v")))
+    if _EPHEMERAL_DIRS.search(path):
+        return True
+    # also catch a uv cache that was relocated to a custom directory
+    return "\\uv\\cache\\" in path and "\\scripts\\" in path
 
 
 def persistent_install_spec() -> Optional[str]:

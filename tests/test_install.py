@@ -49,6 +49,16 @@ def test_entry_env_overrides_defaults():
     assert entry["env"]["PDMCP_ATTACH_MODE"] == "auto"
 
 
+def test_ephemeral_detection_covers_a_relocated_cache():
+    """The uv cache can be moved; the check must not assume ~/uv/cache."""
+    assert inst.is_ephemeral_runtime(
+        r"E:\work\.workbuddy\uvcache_v2\archive-v0\abc\Scripts\powerdesigner-mcp.exe")
+    assert inst.is_ephemeral_runtime(
+        r"C:\Users\me\AppData\Local\uv\cache\environments-v1\xyz\python.exe")
+    assert not inst.is_ephemeral_runtime(r"C:\Users\me\.local\bin\powerdesigner-mcp.exe")
+    assert not inst.is_ephemeral_runtime(r"E:\projects\archive-review\src\app.py")
+
+
 def test_ephemeral_runtime_is_refused(monkeypatch):
     """A uvx cache interpreter would produce a config that rots - refuse it."""
     monkeypatch.setattr(inst.sys, "executable",
