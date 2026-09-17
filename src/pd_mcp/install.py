@@ -136,6 +136,63 @@ def is_ephemeral_runtime(exe: Optional[str] = None) -> bool:
                     ("archive-v", "environments-v", "builds-v", "wheels-v")))
 
 
+def persistent_install_spec() -> Optional[str]:
+    """A spec that would install this package persistently.
+
+    ``uvx``/``uv tool run`` execute in a throw-away environment, so a config
+    written from there would rot.  The distribution's ``direct_url.json`` says
+    where the running copy came from, which is enough to re-install it as a
+    proper uv tool and register *that* launcher instead.
+    """
+    try:
+        import importlib.metadata as md
+        dist = md.distribution("powerdesigner-mcp")
+        raw = dist.read_text("direct_url.json")
+        if raw:
+            data = json.loads(raw)
+            url = str(data.get("url") or "")
+            vcs = data.get("vcs_info") or {}
+            if vcs.get("vcs") == "git" and url:
+                commit = vcs.get("commit_id") or ""
+                return f"git+{url}@{commit}" if commit else f"git+{url}"
+            if url:
+                return url
+        # installed from an index - the bare name is enough, pinned to what is
+        # running so a uvx invocation cannot silently upgrade
+        return f"powerdesigner-mcp=={dist.version}"
+    except Exception:
+        return None
+
+
+def ensure_persistent_launcher(dry_run: bool = False,
+                               which=shutil.which) -> Optional[Path]:
+    """Install this package as a uv tool when running from a throw-away env.
+
+    Returns the launcher path, or None when the runtime is already persistent.
+    """
+    if not is_ephemeral_runtime():
+        return None
+    spec = persistent_install_spec()
+    if spec is None:
+        raise ValueError(
+            "this interpreter lives in a temporary uv/uvx cache and the "
+            "installed distribution does not record where it came from, so it "
+            "cannot be re-installed persistently. Run instead:\n"
+            "  uv tool install <path or git+url of this project>\n"
+            "  powerdesigner-mcp install")
+    if dry_run:
+        return None
+    uv = which("uv") or "uv"
+    proc = subprocess.run([uv, "tool", "install", spec],
+                          capture_output=True, text=True, timeout=600)
+    launcher = uv_tool_script()
+    if proc.returncode != 0 and launcher is None:
+        raise ValueError(
+            f"could not install the package as a uv tool ({' '.join([uv, 'tool', 'install', spec])}):\n"
+            f"{(proc.stderr or proc.stdout or '').strip()[:400]}")
+    return launcher
+
+
 def build_server_entry(name: str = DEFAULT_SERVER_NAME,
                        env: Optional[Dict[str, str]] = None,
                        extra_args: Optional[list] = None,
@@ -277,14 +334,20 @@ def install(clients: Optional[list] = None, name: str = DEFAULT_SERVER_NAME,
     Raises ``ValueError`` when the current environment cannot produce a durable
     launcher (see :func:`build_server_entry`).
     """
+    # A uvx/`uv tool run` invocation is throw-away: make the install persistent
+    # first, then register the launcher that will still exist tomorrow.
+    promoted_launcher = ensure_persistent_launcher(dry_run=dry_run, which=which)
     entry = build_server_entry(name=name, env=env, which=which,
-                               probe_uv=probe_uv, command=command)
+                               probe_uv=probe_uv, command=command,
+                               tool_script=promoted_launcher)
     if print_only:
         return {"launch": entry["launch"], "server": name,
                 "entry": {k: v for k, v in entry.items() if k != "launch"}}
 
     report: Dict[str, Any] = {"launch": entry["launch"], "clients": {},
-                              "server": name, "dry_run": dry_run}
+                              "server": name, "dry_run": dry_run,
+                              "persistent_launcher": (str(promoted_launcher)
+                                                      if promoted_launcher else None)}
 
     wanted = clients or detected_clients(home, appdata) or ["workbuddy"]
     paths = client_config_paths(home, appdata)
@@ -312,6 +375,9 @@ def install(clients: Optional[list] = None, name: str = DEFAULT_SERVER_NAME,
 def describe(report: Dict[str, Any]) -> str:
     """Human-readable summary for the CLI."""
     lines = [f"launch : {report.get('launch', '?')}"]
+    if report.get("persistent_launcher"):
+        lines.append(f"note   : installed persistently as a uv tool -> "
+                     f"{report['persistent_launcher']}")
     if "entry" in report:
         lines.append(json.dumps({"mcpServers": {report["server"]: report["entry"]}},
                                 ensure_ascii=False, indent=2))

@@ -8,7 +8,7 @@
 [![Python](https://img.shields.io/badge/python-3.10%2B-blue)](#quick-start)
 [![PowerDesigner](https://img.shields.io/badge/tested--with-PowerDesigner%2016.5-green)](#verified-environment)
 [![MCP](https://img.shields.io/badge/protocol-MCP%20stdio-purple)](https://modelcontextprotocol.io)
-[![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](LICENSE)
+[![License: MIT](https://img.shields.io/badge/license-MIT-yellow)](https://github.com/NovolineGast/powerdesigner-mcp/blob/main/LICENSE)
 
 **English** | [中文](#中文文档)
 
@@ -62,7 +62,7 @@ PowerDesignerAdapter (interface)
 Adapter isolation means version differences (16.x / 17.x) stay inside the COM
 layer; every assumption is verified against the vendor's own constants file,
 `.NET` interop metadata, and live experiments — see
-[docs/com-api-notes.md](docs/com-api-notes.md).
+[docs/com-api-notes.md](https://github.com/NovolineGast/powerdesigner-mcp/blob/main/docs/com-api-notes.md).
 
 ## Quick start
 
@@ -105,6 +105,21 @@ powerdesigner-mcp install --print-only    # print the entry JSON
 > venv's interpreter path **and** a `PYTHONPATH` pointing at `src`. Installing
 > the package itself removes both, and `install` computes whatever remains by
 > itself — including the uv tool launcher when the host does not inherit `PATH`.
+
+### Even shorter: no clone, no local checkout
+
+```powershell
+# installs the package persistently, then writes the client configs
+uvx --from git+https://github.com/NovolineGast/powerdesigner-mcp powerdesigner-mcp install
+
+# after the first PyPI release:
+uvx powerdesigner-mcp install
+```
+
+`uvx` runs in a throw-away environment, which would produce a config pointing
+into a cache that gets pruned — so `install` detects that, re-installs the
+package as a proper `uv tool` (reusing the recorded source: git URL, archive or
+PyPI name + version) and registers *that* launcher instead.
 
 ### Manual / other platforms
 
@@ -220,13 +235,13 @@ installer also accepts an explicit launcher:
 | `PDMCP_DEFAULT_DBMS` | PD default | e.g. `MySQL 5.0` for new PDMs |
 | `PDMCP_CALL_TIMEOUT` | `300` | Per COM-call timeout (seconds) |
 
-Full list in [`src/pd_mcp/config.py`](src/pd_mcp/config.py). A JSON config file
+Full list in [`src/pd_mcp/config.py`](https://github.com/NovolineGast/powerdesigner-mcp/blob/main/src/pd_mcp/config.py). A JSON config file
 (`pdmcp.json`) is also supported.
 
 ## Development & testing
 
 ```powershell
-.venv\Scripts\python.exe -m pytest tests -m "not live"    # 42 unit/smoke tests (mock backend)
+.venv\Scripts\python.exe -m pytest tests -m "not live"    # unit/smoke tests (mock backend)
 $env:PDMCP_LIVE = "1"
 .venv\Scripts\python.exe -m pytest tests -m live          # live acceptance (real PowerDesigner)
 .venv\Scripts\python.exe -m pd_mcp probe                  # standalone COM capability probe
@@ -237,12 +252,19 @@ reference FK migration, index column binding) so the full pipeline — including
 schema orchestration, validation, transactions and DDL — is tested without a
 PowerDesigner license.
 
+CI runs the suite on `windows-latest` (Python 3.10 and 3.13) and separately
+builds the sdist/wheel, validates the metadata with `twine check --strict`,
+asserts the wheel carries the server and its entry point, and installs it before
+running the CLI. Releases are cut by pushing a `v*` tag — see
+[docs/RELEASING.md](https://github.com/NovolineGast/powerdesigner-mcp/blob/main/docs/RELEASING.md)
+for the one-time PyPI Trusted Publisher setup.
+
 ## Verified environment & honest limitations
 
 - **Verified**: PowerDesigner **16.5.0.3982** on Windows 10/11, 64-bit Python
   3.13. COM facts verified against the vendor's `VBScriptConstants.vbs`,
   `Interop.*.dll` metadata, official C# sample and live probes — see
-  [docs/com-api-notes.md](docs/com-api-notes.md).
+  [docs/com-api-notes.md](https://github.com/NovolineGast/powerdesigner-mcp/blob/main/docs/com-api-notes.md).
 - `CheckModel()` returns `None` on 16.5 (results go to PD's Result List window);
   machine-readable findings come from `validate_model` / `check_database_design`.
 - PowerDesigner has **no SaveAs**: saving an unsaved model to a new path is
@@ -260,7 +282,7 @@ PowerDesigner license.
 
 ## License
 
-[MIT](LICENSE)
+[MIT](https://github.com/NovolineGast/powerdesigner-mcp/blob/main/LICENSE)
 
 ---
 
@@ -330,7 +352,7 @@ PowerDesignerAdapter（抽象接口）
 
 Adapter 隔离使版本差异（16.x/17.x）被限制在 COM 层内；所有 API 假设均经厂商
 常量文件、.NET Interop 元数据与真机实验验证——见
-[docs/com-api-notes.md](docs/com-api-notes.md)。
+[docs/com-api-notes.md](https://github.com/NovolineGast/powerdesigner-mcp/blob/main/docs/com-api-notes.md)。
 
 ### 快速开始
 
@@ -380,6 +402,21 @@ py -3 -m venv .venv
 ```
 
 客户端配置样例（正常无需手写，由 `powerdesigner-mcp install` 生成）见上文英文部分。
+
+连 clone 都不需要的一条命令：
+
+```powershell
+uvx --from git+https://github.com/NovolineGast/powerdesigner-mcp powerdesigner-mcp install
+# PyPI 首次发布之后：
+uvx powerdesigner-mcp install
+```
+
+`uvx` 跑在一次性环境里，写进配置的路径会被缓存清理掉；`install` 会识别这一点，
+按记录的来源（git 地址 / 归档 / PyPI 名称+版本）把包重装成常驻的 `uv tool`，
+再注册那个启动器。
+
+发布流程（打标签自动发 PyPI）见
+[docs/RELEASING.md](https://github.com/NovolineGast/powerdesigner-mcp/blob/main/docs/RELEASING.md)。
 
 ### 工具目录
 
@@ -432,7 +469,7 @@ table / relationships / indexes 子资源　**Prompts**：`database_design_workf
 | `PDMCP_DEFAULT_DBMS` | PD 默认 | 新建 PDM 的 DBMS，如 `MySQL 5.0` |
 | `PDMCP_CALL_TIMEOUT` | `300` | 单次 COM 调用超时（秒） |
 
-完整清单见 [`src/pd_mcp/config.py`](src/pd_mcp/config.py)；也支持 JSON 配置文件（`pdmcp.json`）。
+完整清单见 [`src/pd_mcp/config.py`](https://github.com/NovolineGast/powerdesigner-mcp/blob/main/src/pd_mcp/config.py)；也支持 JSON 配置文件（`pdmcp.json`）。
 
 ### 开发与测试
 
@@ -450,7 +487,7 @@ Mock 后端复刻 PowerDesigner 语义（列 Primary 主键、引用 FK 迁移�
 
 - **验证环境**：Windows 10/11 + PowerDesigner **16.5.0.3982** + 64 位 Python 3.13。
   COM 事实经厂商 `VBScriptConstants.vbs`、`Interop.*.dll` 元数据、官方 C# 样例
-  与真机实验交叉验证——见 [docs/com-api-notes.md](docs/com-api-notes.md)。
+  与真机实验交叉验证——见 [docs/com-api-notes.md](https://github.com/NovolineGast/powerdesigner-mcp/blob/main/docs/com-api-notes.md)。
 - 16.5 的 `CheckModel()` 返回 `None`（结果进 PD Result List 窗口）；机器可读的
   检查结果由 `validate_model` / `check_database_design` 提供。
 - PowerDesigner **没有 SaveAs**：未保存模型另存通过 ShellNew 模板文件绑定 +
@@ -465,4 +502,4 @@ Mock 后端复刻 PowerDesigner 语义（列 Primary 主键、引用 FK 迁移�
 
 ### 许可证
 
-[MIT](LICENSE)
+[MIT](https://github.com/NovolineGast/powerdesigner-mcp/blob/main/LICENSE)

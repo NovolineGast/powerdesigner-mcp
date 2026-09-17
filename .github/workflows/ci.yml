@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  tests:
+    # The product drives PowerDesigner over Windows COM, so Windows is the
+    # environment the suite is meaningful in (COM paths degrade to the mock).
+    runs-on: windows-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install (package + dev extras)
+        run: uv sync --extra dev
+
+      - name: Tests (mock backend)
+        env:
+          PDMCP_ADAPTER: mock
+        run: uv run --no-sync pytest -m "not live" -q
+
+  package:
+    # Builds the artifacts that would be published, and checks the things that
+    # are only visible in the built wheel.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+
+      - name: Build sdist + wheel
+        run: uv build
+
+      - name: Validate metadata
+        run: uvx twine check --strict dist/*
+
+      - name: The wheel must carry the server, the installer and the entry point
+        run: |
+          python3 - <<'PY'
+          import glob, zipfile
+          wheel = glob.glob("dist/*.whl")[0]
+          archive = zipfile.ZipFile(wheel)
+          names = archive.namelist()
+          required = [
+              "pd_mcp/__init__.py",
+              "pd_mcp/__main__.py",
+              "pd_mcp/install.py",
+              "pd_mcp/powerdesigner/com_adapter.py",
+              "pd_mcp/powerdesigner/mock_adapter.py",
+          ]
+          missing = [name for name in required if name not in names]
+          assert not missing, f"missing from the wheel: {missing}"
+          leaked = [name for name in names if name.startswith(("tests/", "logs/", "backups/"))]
+          assert not leaked, f"non-package files leaked into the wheel: {leaked}"
+          entry = [n for n in names if n.endswith("entry_points.txt")]
+          assert entry, "no entry_points.txt"
+          text = archive.read(entry[0]).decode()
+          assert "powerdesigner-mcp" in text, text
+          print("wheel OK:", wheel, len(names), "files")
+          PY
+
+      - name: Install the built wheel and run the CLI
+        run: |
+          uv tool install --force ./dist/*.whl
+          powerdesigner-mcp version
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-ci
+          path: dist/

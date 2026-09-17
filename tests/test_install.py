@@ -67,6 +67,97 @@ def test_explicit_command_bypasses_resolution(monkeypatch):
     assert "explicit" in entry["launch"]
 
 
+class _FakeDist:
+    version = "0.1.0"
+
+    def __init__(self, direct_url):
+        self._direct_url = direct_url
+
+    def read_text(self, name):
+        return self._direct_url
+
+
+def _fake_distribution(monkeypatch, dist):
+    import importlib.metadata as md
+
+    def fake(name):
+        if dist is None:
+            raise md.PackageNotFoundError(name)
+        return dist
+
+    monkeypatch.setattr(md, "distribution", fake)
+
+
+def test_persistent_spec_from_git_checkout(monkeypatch):
+    _fake_distribution(monkeypatch, _FakeDist(json.dumps({
+        "url": "https://github.com/me/proj", "vcs_info": {"vcs": "git", "commit_id": "abc123"}})))
+    assert inst.persistent_install_spec() == "git+https://github.com/me/proj@abc123"
+
+
+def test_persistent_spec_from_archive_url(monkeypatch):
+    _fake_distribution(monkeypatch, _FakeDist(json.dumps({"url": "file:///E:/proj"})))
+    assert inst.persistent_install_spec() == "file:///E:/proj"
+
+
+def test_persistent_spec_pins_the_index_version(monkeypatch):
+    _fake_distribution(monkeypatch, _FakeDist(None))
+    assert inst.persistent_install_spec() == "powerdesigner-mcp==0.1.0"
+
+
+def test_persistent_spec_unknown_distribution(monkeypatch):
+    _fake_distribution(monkeypatch, None)
+    assert inst.persistent_install_spec() is None
+
+
+def test_ensure_launcher_is_noop_when_already_persistent(monkeypatch):
+    monkeypatch.setattr(inst, "is_ephemeral_runtime", lambda exe=None: False)
+    assert inst.ensure_persistent_launcher() is None
+
+
+def test_ensure_launcher_dry_run_does_not_install(monkeypatch):
+    monkeypatch.setattr(inst, "is_ephemeral_runtime", lambda exe=None: True)
+    monkeypatch.setattr(inst, "persistent_install_spec", lambda: "powerdesigner-mcp")
+    called = []
+    monkeypatch.setattr(inst.subprocess, "run", lambda *a, **k: called.append(a))
+    assert inst.ensure_persistent_launcher(dry_run=True) is None
+    assert called == []
+
+
+def test_ensure_launcher_installs_the_spec(monkeypatch):
+    monkeypatch.setattr(inst, "is_ephemeral_runtime", lambda exe=None: True)
+    monkeypatch.setattr(inst, "persistent_install_spec", lambda: "git+https://x/y@abc")
+    monkeypatch.setattr(inst, "uv_tool_script", lambda name="powerdesigner-mcp": Path(r"C:\bin\pd.exe"))
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        return type("P", (), {"returncode": 0, "stdout": "", "stderr": ""})()
+
+    monkeypatch.setattr(inst.subprocess, "run", fake_run)
+    assert inst.ensure_persistent_launcher() == Path(r"C:\bin\pd.exe")
+    assert seen["cmd"][1:] == ["tool", "install", "git+https://x/y@abc"]
+
+
+def test_ensure_launcher_reports_failure(monkeypatch):
+    monkeypatch.setattr(inst, "is_ephemeral_runtime", lambda exe=None: True)
+    monkeypatch.setattr(inst, "persistent_install_spec", lambda: "powerdesigner-mcp")
+    monkeypatch.setattr(inst, "uv_tool_script", lambda name="powerdesigner-mcp": None)
+    monkeypatch.setattr(inst.subprocess, "run", lambda *a, **k: type(
+        "P", (), {"returncode": 1, "stdout": "", "stderr": "boom"})())
+    with pytest.raises(ValueError, match="boom"):
+        inst.ensure_persistent_launcher()
+
+
+def test_install_uses_the_promoted_launcher(tmp_path, monkeypatch):
+    monkeypatch.setattr(inst, "ensure_persistent_launcher",
+                        lambda dry_run=False, which=inst.shutil.which: Path(r"C:\bin\pd.exe"))
+    report = inst.install(clients=["workbuddy"], home=tmp_path, which=lambda name: None,
+                          probe_uv=False)
+    entry = json.loads((tmp_path / ".workbuddy" / "mcp.json").read_text(encoding="utf-8"))
+    assert entry["mcpServers"]["powerdesigner"]["command"] == r"C:\bin\pd.exe"
+    assert report["persistent_launcher"] == r"C:\bin\pd.exe"
+
+
 def test_merge_creates_file_and_parents(tmp_path):
     path = tmp_path / "nested" / "mcp.json"
     entry = {"command": "x", "args": ["serve"], "env": {}}

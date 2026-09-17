@@ -16,6 +16,41 @@ from pathlib import Path
 from typing import Optional
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
+"""Root of a source checkout (``<root>/src/pd_mcp/config.py``).
+
+When the package is *installed* this points inside the installation tree, which
+is why it must never be used for runtime state - see :func:`state_root_for`.
+"""
+
+
+def state_root_for(package_file: Path, env: Optional[dict] = None,
+                   platform: Optional[str] = None) -> Path:
+    """Directory holding logs/backups by default.
+
+    A source checkout keeps them beside the project (``logs/``, ``backups/``),
+    which is what the docs and ``install.ps1`` refer to.  An installed package
+    must not: the installation tree is usually not writable and it changes on
+    every upgrade (``uv tool install`` gives each version its own environment),
+    so a per-user directory is used instead.
+
+    Overridable with ``PDMCP_STATE_DIR``.
+    """
+    env = os.environ if env is None else env
+    platform = os.name if platform is None else platform
+    override = env.get("PDMCP_STATE_DIR")
+    if override:
+        return Path(override)
+    root = package_file.resolve().parents[2]
+    if (root / "pyproject.toml").is_file() and (root / "src").is_dir():
+        return root
+    if platform == "nt":
+        base = env.get("LOCALAPPDATA") or str(Path.home() / "AppData" / "Local")
+        return Path(base) / "powerdesigner-mcp"
+    xdg = env.get("XDG_STATE_HOME") or str(Path.home() / ".local" / "state")
+    return Path(xdg) / "powerdesigner-mcp"
+
+
+STATE_DIR = state_root_for(Path(__file__))
 
 _ENV_PREFIX = "PDMCP_"
 
@@ -55,8 +90,8 @@ class ServerConfig:
     """never | if-launched | always. Quit PowerDesigner on server shutdown."""
 
     # --- Files / logging ---
-    backup_dir: Path = PROJECT_ROOT / "backups"
-    log_file: Path = PROJECT_ROOT / "logs" / "pdmcp.log"
+    backup_dir: Path = STATE_DIR / "backups"
+    log_file: Path = STATE_DIR / "logs" / "pdmcp.log"
     log_level: str = "INFO"
 
     # --- Tool behaviour ---
@@ -75,9 +110,13 @@ class ServerConfig:
     def load(cls) -> "ServerConfig":
         cfg = cls()
 
-        # 2) JSON config file
+        # 2) JSON config file (PDMCP_CONFIG, else ./pdmcp.json in the checkout
+        #    or the working directory - an installed package has no checkout)
         cfg_path = _env("CONFIG")
-        candidates = [Path(cfg_path)] if cfg_path else [PROJECT_ROOT / "pdmcp.json"]
+        if cfg_path:
+            candidates = [Path(cfg_path)]
+        else:
+            candidates = [PROJECT_ROOT / "pdmcp.json", Path.cwd() / "pdmcp.json"]
         for path in candidates:
             try:
                 if path and path.is_file():
