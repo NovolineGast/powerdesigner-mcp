@@ -66,6 +66,9 @@ jobs:
         with:
           # fail loudly rather than silently skipping a file
           print-hash: true
+          # a version that was already uploaded by hand (or by a re-run) must not
+          # turn the tag red - the index is authoritative
+          skip-existing: true
 
   github-release:
     needs: publish

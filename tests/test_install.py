@@ -190,6 +190,24 @@ def test_install_uses_the_promoted_launcher(tmp_path, monkeypatch):
     assert report["persistent_launcher"] == r"C:\bin\pd.exe"
 
 
+def test_entry_ignores_a_uvx_launcher_found_on_path(monkeypatch):
+    """uvx puts its throw-away env on PATH, so a name hit can be ephemeral."""
+    ephemeral = (r"C:\Users\me\AppData\Local\uv\cache\archive-v0\abc\Scripts"
+                 r"\powerdesigner-mcp.exe")
+    entry = inst.build_server_entry(which=lambda name: ephemeral,
+                                    tool_script=Path(r"C:\bin\durable.exe"))
+    assert entry["command"] == r"C:\bin\durable.exe"
+    assert "uv tool script" in entry["launch"]
+
+
+def test_entry_rejects_an_ephemeral_path_hit_without_an_alternative(monkeypatch):
+    ephemeral = (r"C:\Users\me\AppData\Local\uv\cache\archive-v0\abc\Scripts"
+                 r"\powerdesigner-mcp.exe")
+    monkeypatch.setattr(inst.sys, "executable", ephemeral)
+    with pytest.raises(ValueError, match="uvx cache"):
+        inst.build_server_entry(which=lambda name: ephemeral, probe_uv=False)
+
+
 def test_merge_creates_file_and_parents(tmp_path):
     path = tmp_path / "nested" / "mcp.json"
     entry = {"command": "x", "args": ["serve"], "env": {}}

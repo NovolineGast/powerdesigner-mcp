@@ -246,6 +246,11 @@ def build_server_entry(name: str = DEFAULT_SERVER_NAME,
                 "launch": f"explicit --command ({command})"}
 
     exe = which("powerdesigner-mcp") or which("powerdesigner-mcp.exe")
+    if exe and is_ephemeral_runtime(str(exe)):
+        # uvx puts its throw-away environment on PATH, so a plain name lookup
+        # can resolve to a launcher that disappears with the cache - ignore it
+        # and let the durable options below decide
+        exe = None
     launch = f"console script on PATH ({exe})"
     if not exe:
         found = tool_script if tool_script is not None else (
