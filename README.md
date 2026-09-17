@@ -66,31 +66,64 @@ layer; every assumption is verified against the vendor's own constants file,
 
 ## Quick start
 
-### One-click (Windows PowerShell)
+### Install — one command, no path editing
 
 ```powershell
-git clone https://github.com/<you>/powerdesigner-mcp.git
+git clone https://github.com/NovolineGast/powerdesigner-mcp.git
 cd powerdesigner-mcp
 .\install.ps1
 ```
 
-`install.ps1` checks Python, creates `.venv`, installs dependencies, **runs a
-real COM probe against PowerDesigner** (creates a scratch model, a reference
-with auto-migrated FK, generates SQL, saves, closes — report lands in
-`logs/probe_report.json`), runs a stdio smoke test, and generates ready-to-paste
-client configs in `mcp-configs/`.
+That is the whole install. There is no path to type and no client JSON to
+hand-edit:
 
-### Manual
+1. **The package is installed as a tool** — `uv tool install --editable .` puts
+   `powerdesigner-mcp` in an isolated environment with a launcher on `PATH`
+   (without uv it falls back to an editable install in `.venv`).
+2. **The client config is written for you** — the installer then runs
+   `powerdesigner-mcp install`, resolves the launch command for this machine and
+   merges it into every MCP client it detects: `%USERPROFILE%\.workbuddy\mcp.json`,
+   `%APPDATA%\Claude\claude_desktop_config.json`, `%USERPROFILE%\.cursor\mcp.json`,
+   and `claude mcp add` when that CLI is present. A replaced config is backed up
+   next to the original as `mcp.json.bak-<timestamp>`.
+3. **The result is verified** — a real PowerDesigner COM probe and a stdio smoke
+   test run **on the exact command that was just registered**, so the entry is
+   proven to launch rather than merely written.
+
+Already installed? Re-register at any time (after moving the project, changing
+clients, etc.):
 
 ```powershell
+powerdesigner-mcp install                 # detected clients
+powerdesigner-mcp install --client workbuddy
+powerdesigner-mcp install --dry-run       # preview, write nothing
+powerdesigner-mcp install --print-only    # print the entry JSON
+```
+
+> **Why this needed absolute paths before:** the project used to be installed as
+> *dependencies only* into a `.venv`, so every client entry had to carry the
+> venv's interpreter path **and** a `PYTHONPATH` pointing at `src`. Installing
+> the package itself removes both, and `install` computes whatever remains by
+> itself — including the uv tool launcher when the host does not inherit `PATH`.
+
+### Manual / other platforms
+
+```powershell
+uv tool install --editable .          # recommended: launcher on PATH
+powerdesigner-mcp install             # writes the client configs
+powerdesigner-mcp probe               # COM capability check
+powerdesigner-mcp serve               # start MCP server (stdio)
+
+# without uv:
 py -3 -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-$env:PYTHONPATH = "$PWD\src"
-.venv\Scripts\python.exe -m pd_mcp probe   # COM capability check
-.venv\Scripts\python.exe -m pd_mcp serve   # start MCP server (stdio)
+.venv\Scripts\python.exe -m pip install -e .
+.venv\Scripts\python.exe -m pd_mcp install
 ```
 
 ### MCP client configuration
+
+You normally never write this by hand — `powerdesigner-mcp install` does it.
+Here is what it produces, for reference:
 
 <details open>
 <summary><b>Claude Desktop</b> — <code>%APPDATA%\Claude\claude_desktop_config.json</code></summary>
@@ -99,9 +132,9 @@ $env:PYTHONPATH = "$PWD\src"
 {
   "mcpServers": {
     "powerdesigner": {
-      "command": "C:\\path\\to\\powerdesigner-mcp\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "pd_mcp", "serve"],
-      "env": { "PYTHONPATH": "C:\\path\\to\\powerdesigner-mcp\\src" }
+      "command": "C:\\Users\\<you>\\.local\\bin\\powerdesigner-mcp.exe",
+      "args": ["serve"],
+      "env": { "PDMCP_ATTACH_MODE": "auto", "PDMCP_DEFAULT_DBMS": "MySQL 5.0" }
     }
   }
 }
@@ -118,34 +151,21 @@ Same structure as above, under the `mcpServers` key.
 <summary><b>Claude Code</b></summary>
 
 ```powershell
-claude mcp add powerdesigner -- C:\path\to\powerdesigner-mcp\.venv\Scripts\python.exe -m pd_mcp serve
+claude mcp add powerdesigner -- "$env:USERPROFILE\.local\bin\powerdesigner-mcp.exe" serve
 ```
 </details>
 
 <details>
 <summary><b>WorkBuddy</b> — <code>%USERPROFILE%\.workbuddy\mcp.json</code></summary>
 
-```json
-{
-  "mcpServers": {
-    "powerdesigner": {
-      "command": "C:\\path\\to\\powerdesigner-mcp\\.venv\\Scripts\\python.exe",
-      "args": ["-m", "pd_mcp", "serve"],
-      "env": {
-        "PYTHONPATH": "C:\\path\\to\\powerdesigner-mcp\\src",
-        "PDMCP_ATTACH_MODE": "auto",
-        "PDMCP_DEFAULT_DBMS": "MySQL 5.0"
-      }
-    }
-  }
-}
-```
+Same structure as the Claude Desktop example. Then open **Connector management →
+Custom connectors (top-right) → Trust** the `powerdesigner` server; new MCP
+servers do not activate automatically.
 
-After writing the file, open **Connector management → Custom connectors (top-right)
-→ Trust** the `powerdesigner` server; new MCP servers do not activate automatically.
-If your client cannot pass `env`, install the package into the venv
-(`uv pip install -e .`) and/or point `command` at
-`scripts\powerdesigner-mcp.cmd` (portable wrapper, leave `args` empty).
+If your client cannot pass `env` at all, point `command` at
+`scripts\powerdesigner-mcp.cmd` (portable wrapper, leave `args` empty) — the
+installer also accepts an explicit launcher:
+`powerdesigner-mcp install --command <path>`.
 </details>
 
 ## Tool catalog (55+)
@@ -315,23 +335,51 @@ Adapter 隔离使版本差异（16.x/17.x）被限制在 COM 层内；所有 API
 ### 快速开始
 
 ```powershell
-git clone https://github.com/<you>/powerdesigner-mcp.git
+git clone https://github.com/NovolineGast/powerdesigner-mcp.git
 cd powerdesigner-mcp
-.\install.ps1        # 一键：环境检查 + 依赖 + 真机 COM 探测 + 冒烟测试 + 客户端配置生成
+.\install.ps1        # 一条命令：装包 + 注册客户端 + 真机 COM 探测 + 冒烟测试
 ```
 
-手动安装：
+**不需要手写任何路径**，安装脚本自己完成三件事：
+
+1. **把包装成工具**（`uv tool install --editable .`）：独立环境 + PATH 上的
+   启动器；没有 uv 时退回项目 `.venv` 可编辑安装。
+2. **自动写客户端配置**：随后执行 `powerdesigner-mcp install`，自行解析本机
+   启动命令，并合并进它探测到的所有客户端配置（WorkBuddy / Claude Desktop /
+   Cursor，以及存在 `claude` CLI 时的 `claude mcp add`）；被替换的配置会备份为
+   `mcp.json.bak-<时间戳>`。
+3. **验证配置真能启动**：真机 COM 探测 + 用**刚刚注册的那条命令**跑 stdio 冒烟
+   测试，而不是只把 JSON 写进去。
+
+已装过？随时重新注册（搬目录、换客户端之后）：
 
 ```powershell
-py -3 -m venv .venv
-.venv\Scripts\python.exe -m pip install -r requirements.txt
-$env:PYTHONPATH = "$PWD\src"
-.venv\Scripts\python.exe -m pd_mcp probe   # COM 能力探测
-.venv\Scripts\python.exe -m pd_mcp serve   # 启动 MCP Server（stdio）
+powerdesigner-mcp install                 # 自动探测客户端
+powerdesigner-mcp install --client workbuddy
+powerdesigner-mcp install --dry-run       # 只预览，不写文件
+powerdesigner-mcp install --print-only    # 打印配置 JSON
 ```
 
-客户端配置（Claude Desktop / Cursor / Claude Code）见上文英文部分，安装后
-`mcp-configs/` 目录会生成带绝对路径的三份即用配置。
+> **以前为什么要手写路径**：项目过去只把**依赖**装进 `.venv`，包本身没装，
+> 于是每个客户端条目都必须带 venv 解释器路径 **加** 指向 `src` 的 `PYTHONPATH`。
+> 现在把包装成工具后两者都不需要，剩下的路径由 `install` 自己算——包括宿主不
+> 继承 `PATH` 时改走 uv 工具启动器。
+
+手动安装 / 其他平台：
+
+```powershell
+uv tool install --editable .
+powerdesigner-mcp install
+powerdesigner-mcp probe     # COM 能力探测
+powerdesigner-mcp serve     # 启动 MCP Server（stdio）
+
+# 不用 uv 时：
+py -3 -m venv .venv
+.venv\Scripts\python.exe -m pip install -e .
+.venv\Scripts\python.exe -m pd_mcp install
+```
+
+客户端配置样例（正常无需手写，由 `powerdesigner-mcp install` 生成）见上文英文部分。
 
 ### 工具目录
 

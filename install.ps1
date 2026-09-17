@@ -1,20 +1,27 @@
 # =====================================================================
 # powerdesigner-mcp installer for Windows
 #
-#   .\install.ps1              - full install + verification
-#   .\install.ps1 -SkipProbe   - skip the PowerDesigner COM probe
-#   .\install.ps1 -SkipSmoke   - skip the MCP stdio smoke test
+#   .\install.ps1                      - install + register + verify
+#   .\install.ps1 -Client workbuddy    - register with one client only
+#   .\install.ps1 -NoRegister          - install only, touch no client config
+#   .\install.ps1 -SkipProbe           - skip the PowerDesigner COM probe
+#   .\install.ps1 -SkipSmoke           - skip the MCP stdio smoke test
+#   .\install.ps1 -Index ""            - use the default PyPI instead of the mirror
 #
 # Performs:
-#   1. Environment checks (Python 3.10+, pip, optional .NET / PowerDesigner)
-#   2. Virtual environment (.venv) + dependencies (mcp, pywin32, pytest)
-#   3. PowerDesigner COM capability probe (writes logs/probe_report.json)
-#   4. MCP stdio smoke test (initialize / tools-list / tool-call)
-#   5. Client config examples with absolute paths (mcp-configs/)
+#   1. Environment checks (Python 3.10+, PowerDesigner ProgID)
+#   2. Package install into an isolated tool env (uv) or a .venv fallback
+#   3. Self-registration with the detected MCP clients - the installer writes
+#      the client config for you, so no absolute paths are ever hand-edited
+#   4. PowerDesigner COM probe + MCP stdio smoke test on the *configured*
+#      launch command
 # =====================================================================
 param(
+    [string]$Client = "",
+    [switch]$NoRegister,
     [switch]$SkipProbe,
-    [switch]$SkipSmoke
+    [switch]$SkipSmoke,
+    [string]$Index = "https://pypi.tuna.tsinghua.edu.cn/simple"
 )
 
 $ErrorActionPreference = "Stop"
@@ -50,7 +57,7 @@ $ver = & $py -c "import sys; print('%d.%d.%d' % sys.version_info[:3])"
 Write-Ok "Python $ver ($py)"
 
 # ---------------------------------------------------------------------
-# 2. PowerDesigner (informational; COM probe is the real test)
+# 2. PowerDesigner (informational; the COM probe is the real test)
 # ---------------------------------------------------------------------
 Write-Step "Checking PowerDesigner installation"
 $pdProgId = $false
@@ -64,39 +71,86 @@ if ($pdProgId) {
     Write-Warn2 "ProgID 'PowerDesigner.Application' NOT registered."
     Write-Host "       If PowerDesigner is installed, run once as admin:" -ForegroundColor Gray
     Write-Host "         <PD home>\pdlegacyshell16.exe /RegServer" -ForegroundColor Gray
-    Write-Host "       The MCP server can also launch PD itself (attach_mode=auto)." -ForegroundColor Gray
+    Write-Host "       The server can also launch PD itself (attach_mode=auto)." -ForegroundColor Gray
 }
 
 # ---------------------------------------------------------------------
-# 3. Virtual environment + dependencies
+# 3. Install the package itself (not just its dependencies)
+#
+#    uv tool install puts the console script on PATH in an isolated env, which
+#    is what makes the client config path-free (the "npx experience").  Without
+#    uv we fall back to a project venv with an editable install.
 # ---------------------------------------------------------------------
-Write-Step "Creating virtual environment (.venv)"
-if (-not (Test-Path ".venv")) {
-    & $py -m venv .venv
-    Write-Ok ".venv created"
+Write-Step "Installing the package"
+$uv = Get-Command uv -ErrorAction SilentlyContinue
+$launcher = $null
+if ($uv) {
+    $arr = @("tool", "install", "--editable", ".")
+    if ($Index) { $arr += @("--index-url", $Index) }
+    Write-Host "  uv $($arr -join ' ')" -ForegroundColor Gray
+    & uv @arr
+    if ($LASTEXITCODE -eq 0) {
+        $launcher = (Get-Command powerdesigner-mcp -ErrorAction SilentlyContinue).Source
+        if ($launcher) { Write-Ok "installed as a uv tool: $launcher" }
+        else { Write-Warn2 "uv reported success but 'powerdesigner-mcp' is not on PATH" }
+    } else {
+        Write-Warn2 "uv tool install failed; falling back to a project venv"
+    }
 } else {
-    Write-Ok ".venv already exists"
+    Write-Warn2 "uv not found - using a project venv instead (configs then carry a python path)"
 }
-$vexe = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
 
-Write-Step "Installing dependencies (mcp, pywin32)"
-& $vexe -m pip install --quiet --disable-pip-version-check `
-    -i https://pypi.tuna.tsinghua.edu.cn/simple `
-    "mcp>=1.2.0,<2.0" "pywin32>=306" "pytest>=8.0"
-if ($LASTEXITCODE -ne 0) {
-    Write-Warn2 "pip install failed (network?). Retry manually:"
-    Write-Host "       .venv\Scripts\python.exe -m pip install -r requirements.txt" -ForegroundColor Gray
-    exit 1
+if (-not $launcher) {
+    if (-not (Test-Path ".venv")) {
+        & $py -m venv .venv
+        Write-Ok ".venv created"
+    } else {
+        Write-Ok ".venv already exists"
+    }
+    $venvPy = Join-Path $ProjectRoot ".venv\Scripts\python.exe"
+    $pipArgs = @("-m", "pip", "install", "--quiet", "--disable-pip-version-check", "-e", ".")
+    if ($Index) { $pipArgs += @("-i", $Index) }
+    & $venvPy @pipArgs
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn2 "editable install failed (network?). Retry manually:"
+        Write-Host "       .venv\Scripts\python.exe -m pip install -e ." -ForegroundColor Gray
+        exit 1
+    }
+    Write-Ok "installed into .venv (editable)"
+    $launcher = $venvPy
 }
-Write-Ok "dependencies installed"
 
 # ---------------------------------------------------------------------
-# 4. COM capability probe (real PowerDesigner round-trip)
+# 4. Self-registration: the installer writes the client config
+# ---------------------------------------------------------------------
+if (-not $NoRegister) {
+    Write-Step "Registering with MCP clients"
+    $cmdArgs = @("install")
+    if ($Client) { $cmdArgs += @("--client", $Client) }
+    if ($launcher -like "*python.exe") {
+        $env:PYTHONPATH = Join-Path $ProjectRoot "src"
+        & $launcher -m pd_mcp @cmdArgs
+        Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
+    } else {
+        & $launcher @cmdArgs
+    }
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warn2 "registration failed - add the entry manually (see README)"
+    } else {
+        Write-Ok "client configs updated (a backup of any replaced file was kept)"
+    }
+} else {
+    Write-Host "Skipping registration (-NoRegister)"
+}
+
+# ---------------------------------------------------------------------
+# 5. PowerDesigner COM probe
 # ---------------------------------------------------------------------
 if (-not $SkipProbe) {
-    Write-Step "Running PowerDesigner COM probe (this may launch PowerDesigner)"
+    Write-Step "Running PowerDesigner COM probe (may launch PowerDesigner)"
     $env:PYTHONPATH = Join-Path $ProjectRoot "src"
-    & $vexe -m pd_mcp probe
+    if ($launcher -like "*python.exe") { & $launcher -m pd_mcp probe }
+    else { & $launcher probe }
     if ($LASTEXITCODE -eq 0) {
         Write-Ok "probe passed - see logs\probe_report.json"
     } else {
@@ -104,72 +158,42 @@ if (-not $SkipProbe) {
         Write-Host "       Check logs\pdmcp.log and logs\probe_report.json" -ForegroundColor Gray
         Write-Host "       Set PDMCP_ATTACH_MODE=launch to let the server start PD itself." -ForegroundColor Gray
     }
+    Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue
 } else {
     Write-Host "Skipping probe (-SkipProbe)"
 }
 
 # ---------------------------------------------------------------------
-# 5. MCP stdio smoke test
+# 6. MCP stdio smoke test on the command that was just registered
 # ---------------------------------------------------------------------
 if (-not $SkipSmoke) {
-    Write-Step "Running MCP stdio smoke test (mock backend)"
+    Write-Step "Smoke-testing the configured launch command"
+    $json = if ($launcher -like "*python.exe") {
+        @($launcher, "-m", "pd_mcp", "serve") | ConvertTo-Json -Compress
+    } else {
+        @($launcher, "serve") | ConvertTo-Json -Compress
+    }
+    $prevCmd = $env:PDMCP_SMOKE_CMD
+    $prevPy = $env:PYTHONPATH
+    $env:PDMCP_SMOKE_CMD = $json
     $env:PYTHONPATH = Join-Path $ProjectRoot "src"
-    $env:PDMCP_ADAPTER = "mock"
-    & $vexe (Join-Path $ProjectRoot "scripts\smoke_test.py")
+    # the smoke test itself only needs a Python 3.10+; the launch command under
+    # test comes from PDMCP_SMOKE_CMD, i.e. exactly what was registered
+    $smokePy = if ($launcher -like "*python.exe") { $launcher }
+               elseif (Test-Path ".venv\Scripts\python.exe") { Join-Path $ProjectRoot ".venv\Scripts\python.exe" }
+               else { $py }
+    & $smokePy (Join-Path $ProjectRoot "scripts\smoke_test.py")
     if ($LASTEXITCODE -eq 0) { Write-Ok "smoke test passed" }
     else { Write-Warn2 "smoke test failed - see output above" }
-    Remove-Item Env:PDMCP_ADAPTER -ErrorAction SilentlyContinue
+    if ($prevCmd) { $env:PDMCP_SMOKE_CMD = $prevCmd } else { Remove-Item Env:PDMCP_SMOKE_CMD -ErrorAction SilentlyContinue }
+    if ($prevPy) { $env:PYTHONPATH = $prevPy } else { Remove-Item Env:PYTHONPATH -ErrorAction SilentlyContinue }
 }
 
-# ---------------------------------------------------------------------
-# 6. Client configuration examples
-# ---------------------------------------------------------------------
-Write-Step "Generating client config examples (mcp-configs\)"
-New-Item -ItemType Directory -Force -Path "mcp-configs" | Out-Null
-$pyExe = $vexe
-$workDir = $ProjectRoot
-
-$claudeDesktop = @{
-    mcpServers = @{
-        powerdesigner = @{
-            command = $pyExe
-            args    = @("-m", "pd_mcp", "serve")
-            env     = @{ PYTHONPATH = (Join-Path $ProjectRoot "src") }
-        }
-    }
-}
-$claudeDesktop | ConvertTo-Json -Depth 6 |
-    Out-File "mcp-configs\claude_desktop.json" -Encoding utf8
-
-$cursor = @{
-    mcpServers = @{
-        powerdesigner = @{
-            command = $pyExe
-            args    = @("-m", "pd_mcp", "serve")
-            env     = @{ PYTHONPATH = (Join-Path $ProjectRoot "src") }
-        }
-    }
-}
-$cursor | ConvertTo-Json -Depth 6 | Out-File "mcp-configs\cursor.json" -Encoding utf8
-
-@"
-# Claude Code: run one of the following
-claude mcp add powerdesigner -- "$pyExe" -m pd_mcp serve
-# with env (PowerShell):
-#   $env:PYTHONPATH = "$ProjectRoot\src"   (or use the -e option of claude mcp add)
-"@ | Out-File "mcp-configs\claude_code.txt" -Encoding utf8
-
-Write-Ok "wrote mcp-configs\claude_desktop.json / cursor.json / claude_code.txt"
-
-# ---------------------------------------------------------------------
 Write-Step "Done"
 Write-Host @"
-Next steps:
- 1. Claude Desktop : merge mcp-configs\claude_desktop.json into
-                     %APPDATA%\Claude\claude_desktop_config.json
- 2. Cursor         : merge mcp-configs\cursor.json into
-                     %USERPROFILE%\.cursor\mcp.json
- 3. Claude Code    : claude mcp add powerdesigner -- "$pyExe" -m pd_mcp serve
- 4. Run tests      : .venv\Scripts\python.exe -m pytest tests -m "not live"
- 5. Live probe     : .venv\Scripts\python.exe -m pd_mcp probe
+Common commands:
+  powerdesigner-mcp serve                 # run the stdio server
+  powerdesigner-mcp probe                 # verify PowerDesigner COM
+  powerdesigner-mcp install --dry-run     # preview client config changes
+  .venv\Scripts\python.exe -m pytest tests -m "not live"
 "@ -ForegroundColor Gray

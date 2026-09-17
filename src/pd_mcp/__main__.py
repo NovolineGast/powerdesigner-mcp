@@ -20,24 +20,71 @@ from .logging_setup import setup_logging  # noqa: E402
 def main(argv: list | None = None) -> int:
     parser = argparse.ArgumentParser(prog="powerdesigner-mcp",
                                      description="PowerDesigner MCP Server")
-    parser.add_argument("command", nargs="?", default="serve",
-                        choices=["serve", "probe", "version"])
+    sub = parser.add_subparsers(dest="command")
+    sub.add_parser("serve", help="run the stdio MCP server (default)")
+    sub.add_parser("probe", help="verify PowerDesigner COM connectivity")
+    sub.add_parser("version", help="print the version")
+    p_install = sub.add_parser(
+        "install", help="register this server with MCP clients (no hand-edited paths)")
+    p_install.add_argument("--client", action="append", dest="clients",
+                           choices=["workbuddy", "claude-desktop", "cursor",
+                                    "claude-code", "all"],
+                           help="client to configure; repeatable "
+                                "(default: every client detected on this machine)")
+    p_install.add_argument("--name", default="powerdesigner",
+                           help="server name in the client config")
+    p_install.add_argument("--attach-mode", default="",
+                           help="PDMCP_ATTACH_MODE (auto|attach|launch)")
+    p_install.add_argument("--default-dbms", default="",
+                           help="PDMCP_DEFAULT_DBMS, e.g. 'MySQL 5.0'")
+    p_install.add_argument("--dry-run", action="store_true",
+                           help="report what would change without writing")
+    p_install.add_argument("--print-only", action="store_true",
+                           help="print the config entry and exit")
+    # dest="launcher": a plain --command would overwrite the subcommand name
+    # stored in args.command by add_subparsers
+    p_install.add_argument("--command", dest="launcher", default="",
+                           help="launcher to register, overriding auto-detection")
     args = parser.parse_args(argv)
+    command = args.command or "serve"
 
-    if args.command == "version":
+    if command == "version":
         print(f"powerdesigner-mcp {__version__}")
+        return 0
+
+    if command == "install":
+        from .install import CLIENTS, describe, install
+        clients = None if not args.clients else args.clients
+        if clients and "all" in clients:
+            clients = list(CLIENTS)
+        env = {}
+        if args.attach_mode:
+            env["PDMCP_ATTACH_MODE"] = args.attach_mode
+        if args.default_dbms:
+            env["PDMCP_DEFAULT_DBMS"] = args.default_dbms
+        try:
+            report = install(clients=clients, name=args.name, env=env or None,
+                             dry_run=args.dry_run, print_only=args.print_only,
+                             command=args.launcher or None)
+        except ValueError as exc:
+            print(f"cannot register this environment:\n{exc}", file=sys.stderr)
+            return 2
+        print(describe(report))
+        if not args.print_only:
+            print("\nNext: open the client's connector list and Trust the new "
+                  "server - it will not activate before that.")
         return 0
 
     config = get_config()
     setup_logging(config.log_file, config.log_level)
 
-    if args.command == "serve":
+    if command == "serve":
         from .mcp_server.app import create_server
         mcp = create_server()
         mcp.run(transport="stdio")
         return 0
 
-    if args.command == "probe":
+    if command == "probe":
         return _probe(config)
 
 

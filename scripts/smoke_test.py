@@ -1,5 +1,12 @@
 # -*- coding: utf-8 -*-
-"""MCP stdio smoke test: initialize -> tools/list -> tools/call round-trip."""
+"""MCP stdio smoke test: initialize -> tools/list -> tools/call round-trip.
+
+By default it launches the server from this checkout.  Set ``PDMCP_SMOKE_CMD``
+to a JSON array to smoke-test an arbitrary launch command instead - e.g. the
+exact command an installer just wrote into a client config:
+
+    set PDMCP_SMOKE_CMD=["C:\\Users\\me\\.local\\bin\\powerdesigner-mcp.exe","serve"]
+"""
 import json
 import os
 import subprocess
@@ -19,17 +26,30 @@ def check(name, cond, detail=""):
         FAILURES.append(name)
 
 
-def main() -> int:
+def launch_command() -> list:
+    raw = os.environ.get("PDMCP_SMOKE_CMD")
+    if raw:
+        cmd = json.loads(raw)
+        if not isinstance(cmd, list) or not cmd:
+            raise SystemExit("PDMCP_SMOKE_CMD must be a JSON array, e.g. [\"exe\",\"serve\"]")
+        return [str(c) for c in cmd]
     vexe = PROJECT / ".venv" / "Scripts" / "python.exe"
     py = str(vexe) if vexe.exists() else sys.executable
+    return [py, "-m", "pd_mcp", "serve"]
+
+
+def main() -> int:
+    cmd = launch_command()
+    print(f"launch: {' '.join(cmd)}")
     env = dict(os.environ)
     env["PDMCP_ADAPTER"] = "mock"
-    env["PYTHONPATH"] = str(PROJECT / "src")
     env["PDMCP_LOG_LEVEL"] = "ERROR"
+    if not os.environ.get("PDMCP_SMOKE_CMD"):
+        # the checkout is not necessarily installed, so help the module import
+        env["PYTHONPATH"] = str(PROJECT / "src")
 
     proc = subprocess.Popen(
-        [py, "-m", "pd_mcp", "serve"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+        cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL, env=env, cwd=str(PROJECT))
 
     def rpc(payload):
