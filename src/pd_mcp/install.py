@@ -99,13 +99,8 @@ def source_root() -> Optional[Path]:
     return location.parent.parent if location else None
 
 
-def uv_tool_script(name: str = "powerdesigner-mcp") -> Optional[Path]:
-    """The console script uv installed, found without relying on ``PATH``.
-
-    MCP hosts do not always inherit the user's ``PATH``, so the tool bin
-    directory is asked for explicitly (``uv tool dir --bin``) rather than
-    trusting ``shutil.which`` alone.
-    """
+def uv_tool_bin_dir() -> Optional[Path]:
+    """Directory uv puts tool launchers in (``uv tool dir --bin``)."""
     exe = shutil.which("uv")
     if not exe:
         return None
@@ -114,8 +109,31 @@ def uv_tool_script(name: str = "powerdesigner-mcp") -> Optional[Path]:
                               text=True, timeout=30)
         if proc.returncode != 0:
             return None
-        bin_dir = Path((proc.stdout or "").strip().splitlines()[-1].strip())
+        lines = [line.strip() for line in (proc.stdout or "").splitlines() if line.strip()]
+        return Path(lines[-1]) if lines else None
     except Exception:
+        return None
+
+
+def predicted_tool_script(name: str = "powerdesigner-mcp") -> Optional[Path]:
+    """Where uv *would* put the launcher, whether or not it exists yet.
+
+    Used to preview a registration that has not happened yet.
+    """
+    bin_dir = uv_tool_bin_dir()
+    if bin_dir is None:
+        return None
+    return bin_dir / (f"{name}.exe" if os.name == "nt" else name)
+
+
+def uv_tool_script(name: str = "powerdesigner-mcp") -> Optional[Path]:
+    """The console script uv installed, found without relying on ``PATH``.
+
+    MCP hosts do not always inherit the user's ``PATH``, so the tool bin
+    directory is asked for explicitly rather than trusting ``shutil.which``.
+    """
+    bin_dir = uv_tool_bin_dir()
+    if bin_dir is None:
         return None
     for candidate in (bin_dir / f"{name}.exe", bin_dir / name):
         if candidate.is_file():
@@ -165,10 +183,13 @@ def persistent_install_spec() -> Optional[str]:
 
 
 def ensure_persistent_launcher(dry_run: bool = False,
-                               which=shutil.which) -> Optional[Path]:
+                               which=shutil.which,
+                               name: str = "powerdesigner-mcp") -> Optional[Path]:
     """Install this package as a uv tool when running from a throw-away env.
 
     Returns the launcher path, or None when the runtime is already persistent.
+    In a dry run nothing is installed, but the launcher that *would* be used is
+    returned so the preview shows the real outcome instead of an error.
     """
     if not is_ephemeral_runtime():
         return None
@@ -181,11 +202,11 @@ def ensure_persistent_launcher(dry_run: bool = False,
             "  uv tool install <path or git+url of this project>\n"
             "  powerdesigner-mcp install")
     if dry_run:
-        return None
+        return uv_tool_script(name) or predicted_tool_script(name)
     uv = which("uv") or "uv"
     proc = subprocess.run([uv, "tool", "install", spec],
                           capture_output=True, text=True, timeout=600)
-    launcher = uv_tool_script()
+    launcher = uv_tool_script(name)
     if proc.returncode != 0 and launcher is None:
         raise ValueError(
             f"could not install the package as a uv tool ({' '.join([uv, 'tool', 'install', spec])}):\n"

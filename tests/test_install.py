@@ -114,19 +114,36 @@ def test_ensure_launcher_is_noop_when_already_persistent(monkeypatch):
     assert inst.ensure_persistent_launcher() is None
 
 
-def test_ensure_launcher_dry_run_does_not_install(monkeypatch):
+def test_ensure_launcher_dry_run_predicts_without_installing(monkeypatch):
     monkeypatch.setattr(inst, "is_ephemeral_runtime", lambda exe=None: True)
     monkeypatch.setattr(inst, "persistent_install_spec", lambda: "powerdesigner-mcp")
+    monkeypatch.setattr(inst, "uv_tool_script", lambda name="powerdesigner-mcp": None)
+    monkeypatch.setattr(inst, "predicted_tool_script",
+                        lambda name="powerdesigner-mcp": Path(r"C:\bin\pd.exe"))
     called = []
     monkeypatch.setattr(inst.subprocess, "run", lambda *a, **k: called.append(a))
-    assert inst.ensure_persistent_launcher(dry_run=True) is None
+    assert inst.ensure_persistent_launcher(dry_run=True) == Path(r"C:\bin\pd.exe")
     assert called == []
+
+
+def test_preview_from_a_uvx_runtime_still_shows_the_outcome(tmp_path, monkeypatch):
+    """`uvx ... install --dry-run` must preview, not fail on the ephemeral env."""
+    monkeypatch.setattr(inst, "is_ephemeral_runtime", lambda exe=None: True)
+    monkeypatch.setattr(inst, "persistent_install_spec",
+                        lambda: "powerdesigner-mcp==0.1.0")
+    monkeypatch.setattr(inst, "uv_tool_script", lambda name="powerdesigner-mcp": None)
+    monkeypatch.setattr(inst, "predicted_tool_script",
+                        lambda name="powerdesigner-mcp": Path(r"C:\bin\pd.exe"))
+    report = inst.install(print_only=True, dry_run=True, home=tmp_path,
+                          which=lambda name: None, probe_uv=False)
+    assert report["entry"]["command"] == r"C:\bin\pd.exe"
 
 
 def test_ensure_launcher_installs_the_spec(monkeypatch):
     monkeypatch.setattr(inst, "is_ephemeral_runtime", lambda exe=None: True)
     monkeypatch.setattr(inst, "persistent_install_spec", lambda: "git+https://x/y@abc")
-    monkeypatch.setattr(inst, "uv_tool_script", lambda name="powerdesigner-mcp": Path(r"C:\bin\pd.exe"))
+    monkeypatch.setattr(inst, "uv_tool_script",
+                        lambda name="powerdesigner-mcp": Path(r"C:\bin\pd.exe"))
     seen = {}
 
     def fake_run(cmd, **kwargs):
