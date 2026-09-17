@@ -79,3 +79,16 @@ PyPI does not allow re-uploading a version. **Yank** the bad files in the PyPI
 web UI (the version stays resolvable for existing pins but is hidden from new
 installs), then publish a patch release. Deleting a version is only possible for
 a few hours after upload.
+
+## Troubleshooting
+
+- **`uv tool install git+https://…` fails with no output** — some networks
+  (TLS-inspecting proxies) break uv's git transport while the `git` CLI keeps
+  working. Build and install from a checkout instead:
+  `git clone … && uv build && uv tool install ./dist/*.whl`.
+- **`twine check` complains about the README** — that is usually a relative link
+  or a missing long description; `tests/test_packaging.py` guards both, so run
+  the suite before tagging.
+- **The workflow fails at "Tag must match the package version"** — bump
+  `__version__` in `src/pd_mcp/__init__.py`, commit, then re-tag (delete the tag
+  locally and on the remote first: `git push origin :refs/tags/vX.Y.Z`).

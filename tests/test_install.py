@@ -165,6 +165,21 @@ def test_ensure_launcher_reports_failure(monkeypatch):
         inst.ensure_persistent_launcher()
 
 
+def test_ensure_launcher_explains_a_silent_transport_failure(monkeypatch):
+    """uv exits silently when its git/TLS transport is blocked by the network."""
+    monkeypatch.setattr(inst, "is_ephemeral_runtime", lambda exe=None: True)
+    monkeypatch.setattr(inst, "persistent_install_spec",
+                        lambda: "git+https://github.com/x/y@abc")
+    monkeypatch.setattr(inst, "uv_tool_script", lambda name="powerdesigner-mcp": None)
+    monkeypatch.setattr(inst.subprocess, "run", lambda *a, **k: type(
+        "P", (), {"returncode": 1, "stdout": "", "stderr": ""})())
+    with pytest.raises(ValueError) as excinfo:
+        inst.ensure_persistent_launcher()
+    message = str(excinfo.value)
+    assert "no error output" in message
+    assert "uv tool install <local path" in message
+
+
 def test_install_uses_the_promoted_launcher(tmp_path, monkeypatch):
     monkeypatch.setattr(inst, "ensure_persistent_launcher",
                         lambda dry_run=False, which=inst.shutil.which: Path(r"C:\bin\pd.exe"))

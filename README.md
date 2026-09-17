@@ -106,20 +106,25 @@ powerdesigner-mcp install --print-only    # print the entry JSON
 > the package itself removes both, and `install` computes whatever remains by
 > itself — including the uv tool launcher when the host does not inherit `PATH`.
 
-### Even shorter: no clone, no local checkout
+### Even shorter: no clone needed
 
 ```powershell
-# installs the package persistently, then writes the client configs
-uvx --from git+https://github.com/NovolineGast/powerdesigner-mcp powerdesigner-mcp install
-
-# after the first PyPI release:
+# after the first PyPI release
 uvx powerdesigner-mcp install
+
+# straight from the repository (uv must be able to reach GitHub - see note)
+uvx --from git+https://github.com/NovolineGast/powerdesigner-mcp powerdesigner-mcp install
 ```
 
 `uvx` runs in a throw-away environment, which would produce a config pointing
 into a cache that gets pruned — so `install` detects that, re-installs the
-package as a proper `uv tool` (reusing the recorded source: git URL, archive or
-PyPI name + version) and registers *that* launcher instead.
+package as a proper `uv tool` (reusing the recorded source: PyPI name + version,
+git URL + commit, or archive URL) and registers *that* launcher instead.
+
+> Some networks (TLS-inspecting proxies) block uv's git transport while the
+> `git` CLI still works; uv then fails without an error message. If that
+> happens, install from a checkout instead:
+> `git clone … ; uv tool install --editable . ; powerdesigner-mcp install`.
 
 ### Manual / other platforms
 
@@ -406,14 +411,20 @@ py -3 -m venv .venv
 连 clone 都不需要的一条命令：
 
 ```powershell
-uvx --from git+https://github.com/NovolineGast/powerdesigner-mcp powerdesigner-mcp install
-# PyPI 首次发布之后：
+# PyPI 首次发布之后
 uvx powerdesigner-mcp install
+
+# 直接来自仓库（要求 uv 能访问 GitHub，见下方提示）
+uvx --from git+https://github.com/NovolineGast/powerdesigner-mcp powerdesigner-mcp install
 ```
 
 `uvx` 跑在一次性环境里，写进配置的路径会被缓存清理掉；`install` 会识别这一点，
-按记录的来源（git 地址 / 归档 / PyPI 名称+版本）把包重装成常驻的 `uv tool`，
-再注册那个启动器。
+按记录的来源（PyPI 名称+版本 / git 地址+提交 / 归档地址）把包重装成常驻的
+`uv tool`，再注册那个启动器。
+
+> 少数网络（会做 TLS 拦截的代理）会让 uv 的 git 传输失败而 `git` 命令行仍可用，
+> 此时 uv 不打印任何错误。遇到这种情况请改用本地检出：
+> `git clone … ; uv tool install --editable . ; powerdesigner-mcp install`。
 
 发布流程（打标签自动发 PyPI）见
 [docs/RELEASING.md](https://github.com/NovolineGast/powerdesigner-mcp/blob/main/docs/RELEASING.md)。

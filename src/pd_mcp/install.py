@@ -204,13 +204,23 @@ def ensure_persistent_launcher(dry_run: bool = False,
     if dry_run:
         return uv_tool_script(name) or predicted_tool_script(name)
     uv = which("uv") or "uv"
-    proc = subprocess.run([uv, "tool", "install", spec],
-                          capture_output=True, text=True, timeout=600)
+    cmd = [uv, "tool", "install", spec]
+    proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
     launcher = uv_tool_script(name)
     if proc.returncode != 0 and launcher is None:
+        detail = (proc.stderr or "").strip() or (proc.stdout or "").strip()
+        hint = ""
+        if not detail:
+            # uv can exit silently when its own git/TLS transport is blocked
+            # (seen on networks that interfere with GitHub hosts) - point at the
+            # routes that do not depend on it
+            hint = ("\nuv produced no error output, which usually means its "
+                    "network transport could not reach the source. Alternatives:\n"
+                    "  uv tool install <local path to the checkout>\n"
+                    "  uvx powerdesigner-mcp install        (once released to PyPI)")
         raise ValueError(
-            f"could not install the package as a uv tool ({' '.join([uv, 'tool', 'install', spec])}):\n"
-            f"{(proc.stderr or proc.stdout or '').strip()[:400]}")
+            f"could not install the package as a uv tool ({' '.join(cmd)}):\n"
+            f"{detail[:400]}{hint}")
     return launcher
 
 
